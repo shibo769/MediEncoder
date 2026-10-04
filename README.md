@@ -1,65 +1,125 @@
 # MediEncoder
 
-**MediEncoder** is a representation-learning framework for nonlinear, high-dimensional causal mediation analysis. It jointly learns covariate and mediator representations with a coupled encoder–decoder architecture, then uses a cross-fitted efficient influence-function estimator for natural direct, natural indirect, and total effects.
+Representation learning and cross-fitted estimation for causal mediation analysis.
+This research implementation separates the estimator from simulated truth and uses
+observation-level cross-fitted scores for dataset-specific uncertainty estimates.
 
-This repository contains the core Python implementation and simulation scripts.
+## Repository layout
 
-## Code structure
-
-The implementation is in [`mediencoder_exmaple_code/`](mediencoder_exmaple_code/) (the directory name is spelled this way in the repository).
-
-| Module | Purpose |
-| --- | --- |
-| `nn_utils.py` | MLP construction and device selection |
-| `NNModel_and_Train.py` | Autoencoder/VAE models and nuisance-network trainers |
-| `MediEncoder_and_Train.py` | Coupled model, reconstruction and alignment objectives, and tuning grid |
-| `DGP_and_estimate.py` | Data-generating processes, factor projections, and target effects |
-| `run_and_eval.py` | Cross-fitted estimation, tuning, and single-replication evaluation |
-| `simulation/run_tables_b400.py` | Method comparison and alignment-loss ablation |
-
-## Setup
-
-The source imports **NumPy, pandas, SciPy, scikit-learn, and PyTorch**. Use a Python environment compatible with these packages; dependency versions are not currently pinned in the repository.
-
-```bash
-git clone https://github.com/shibo769/MediEncoder.git
-cd MediEncoder/mediencoder_exmaple_code
-python -m pip install numpy pandas scipy scikit-learn torch
+```text
+src/mediencoder/
+  estimation.py       # Shared cross-fitting and influence-score estimation
+  training.py         # Coupled encoders, training losses, and tuning
+  models.py           # Autoencoders, VAEs, and nuisance regressions
+  nn_utils.py         # Neural-network construction and device selection
+  simulation/         # Fixed wavelet mechanism; main and ablation experiments
+  comparison/         # Separate polynomial experiment and comparison methods
+  real_data/          # Observed-data loading, validation, and effect estimation
+scripts/              # Command-line entry points
+tests/                # Statistical, data-boundary, and execution regression tests
+docs/                 # Methods, corrections, migration, and workflow notes
+requirements/         # Validated environment snapshot
 ```
 
-## Run the simulation
+Generated results and real datasets stay outside version control. The earlier
+`mediencoder_exmaple_code/` layout is retired; see [migration](docs/migration.md).
 
-The simulation compares projection, autoencoder, VAE, and MediEncoder representations, and includes an ablation with the alignment weight fixed to zero.
+## Install
 
-From `mediencoder_exmaple_code/`, run the following example configuration in **Bash**:
+Use Python 3.11 or later in a virtual environment. Install the PyTorch build
+appropriate for your hardware, then install this package:
 
 ```bash
-PYTHONPATH=. TAB_P=2000 TAB_Q=1000 TAB_SIGMA_X=2.0 TAB_TILDE=10 TAB_B=200 \
-  python simulation/run_tables_b400.py
+python -m pip install -e ".[test]"
+python -m pytest -q
 ```
 
-`PYTHONPATH=.` makes the core modules in the current directory available to the simulation script and its worker processes. The example uses wavelet loadings, 2,000 covariates, 1,000 mediators, and 200 replications per method and sample-size setting.
+The development environment used Python 3.12 and PyTorch 2.8.0 with CUDA 12.6.
+Its exact snapshot is in
+[`requirements/validated-windows-cu126.txt`](requirements/validated-windows-cu126.txt).
+That file describes the validated Windows environment; its CUDA-specific torch
+wheel requires the corresponding PyTorch wheel index. CPU installations can use
+the ordinary package dependencies. Other version combinations are not certified.
 
-### Configuration
+## Main simulation and alignment ablation
 
-| Environment variable | Meaning | Default |
-| --- | --- | --- |
-| `TAB_P`, `TAB_Q` | Observed covariate and mediator dimensions | `800`, `200` |
-| `TAB_TILDE` | Working representation dimension for each variable group | `10` |
-| `TAB_N` | Comma-separated sample sizes | `100,300,800,1200,2000,3000` |
-| `TAB_B` | Monte Carlo replications per method and sample size | `400` |
-| `TAB_SIGMA_X`, `TAB_SIGMA_M`, `TAB_SIGMA_Y` | Noise standard deviations | `2.0`, `1.0`, `1.0` |
-| `TAB_SEED` | Base random seed | `880000` |
-| `TAB_TAG` | Output filename prefix | `TABB400` |
+Start with a small execution check:
 
-Full comparison runs involve repeated neural-network training. The runner can start up to 56 worker processes. Use `TAB_N` and `TAB_B` to restrict the experiment size when checking an environment or exploring a configuration.
+```bash
+python -m mediencoder.simulation.runner --output-dir results/pilot --n 100 --reps 1 --pilot-epochs 2 --workers 1 --device cpu
+```
 
-### Outputs
+For the full experiment:
 
-Results are written to `mediencoder_exmaple_code/simulation/rebuttal_results/`:
+```bash
+python -m mediencoder.simulation.runner --output-dir results/formal --workers 1 --device cuda
+```
 
-- CSV files with per-replication results and summary statistics;
-- a LaTeX table body for the method comparison;
-- a LaTeX table body for the alignment-loss ablation.
+To compute the first 50 replications now and extend the same run later, reserve
+200 from the outset and change only the execution target:
 
-The summaries report standard deviation, RMSE, confidence-interval length, and coverage. Performance comparisons depend on the simulation configuration and sample size.
+```bash
+python -m mediencoder.simulation.runner --output-dir results/formal --reps 200 --target-reps 50 --workers 1 --device cuda
+python -m mediencoder.simulation.runner --output-dir results/formal --reps 200 --target-reps 100 --workers 1 --device cuda
+python -m mediencoder.simulation.runner --output-dir results/formal --reps 200 --target-reps 200 --workers 1 --device cuda
+```
+
+Each phase includes every selected sample size and arm. Completed fits retain
+their original seeds, scores, and scientific fingerprint. The manifest records
+the reserved 200; summaries and status show the current target (50, 100, or 200).
+Changing `--reps` itself changes the reserved scientific configuration and is
+rejected when resuming. Omit `--target-reps` to compute the full reservation.
+
+Defaults are six sample sizes (100, 300, 800, 1200, 2000, 3000), 200 replications,
+and five arms: Projection, Autoencoder, VAE, tuned MediEncoder, and MediEncoder
+with zero alignment weight. This is 6,000 fits, each potentially containing many
+neural-network training runs. Both tables share the same tuned MediEncoder fits.
+One worker is the conservative default. Workers are recycled between fits to
+release allocations; increase concurrency only after checking resources.
+
+The same command resumes completed checkpoints only when scientific settings,
+source hashes, the saved mechanism, and runtime identity match. Small-epoch pilot
+results are marked and cannot be merged with the formal experiment.
+Failures retain their seeds and traces; `--retry-failed` archives the previous
+attempt before rerunning the same task. It does not replace difficult datasets.
+
+Outputs include a configuration manifest, task JSON records, per-person score NPZ
+files, `summary.csv`, `main_table.tex`, `ablation_table.tex`, and `status.json`.
+Requested, valid, failed, and pending counts are explicit. Partial summaries are
+not final manuscript results. For durable logs and a refreshing local HTML report:
+
+```bash
+python -m mediencoder.simulation.monitor --output-dir results/formal --reps 200 --target-reps 50 --workers 1 --device cuda
+```
+
+The monitor launches the runner; use it instead of launching a second runner
+against the same output directory. It forwards other runner options and displays
+the saved configuration and current phase. Raise its target to 100 or 200 to
+extend the same run after the previous phase has stopped.
+Interrupting the monitor stops its owned runner and worker processes; completed
+checkpoints are retained, and an interrupted fit is rerun with the same seed.
+
+## Real data and comparison experiments
+
+- [Real-data workflow and input contract](docs/real_data.md)
+- [Polynomial comparison experiment and external baselines](docs/comparison.md)
+- [Scientific corrections and remaining limitations](docs/corrections.md)
+- [Validation performed for this release](docs/validation.md)
+
+All supported MediEncoder workflows call the shared estimator. External baseline
+adaptations are identified explicitly; unavailable standard errors are not
+replaced by Monte Carlo error SDs. Real-data inputs, identifiers, private paths,
+and third-party source repositories are not distributed here.
+
+## Interpretation
+
+Confidence intervals use each dataset's own cross-fitted score variability.
+They remain asymptotic intervals and depend on identification, overlap,
+representation, and nuisance-estimation assumptions. Passing software tests does
+not establish these assumptions or guarantee nominal coverage.
+
+The mediator alignment target intentionally uses stop-gradient; checkpoint
+selection uses reconstruction loss. The implementation is not asserted to solve
+an unconstrained joint scalar-objective argmin. These corrections do not revise
+or certify any manuscript proof. Historical tables must be recomputed; this code
+release does not validate their reported numbers.

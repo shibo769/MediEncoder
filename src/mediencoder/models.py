@@ -10,7 +10,7 @@ import torch.optim as optim
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
 
-from nn_utils import build_mlp, device
+from mediencoder.nn_utils import build_mlp, device
 
 # ============================================================
 # 1) Generic NN for nuisance
@@ -66,7 +66,18 @@ def train_nuisance_nn(
     early_stop=True,
     verbose=False
 ):
-
+    arrays = [np.asarray(v) for v in (X_train, Y_train, X_val, Y_val)]
+    if any(v.size == 0 or not np.isfinite(v).all() for v in arrays):
+        raise ValueError("Nuisance training/validation subsets must be nonempty and finite")
+    if (arrays[0].ndim != 2 or arrays[2].ndim != 2
+            or arrays[1].shape != (len(arrays[0]),)
+            or arrays[3].shape != (len(arrays[2]),)
+            or arrays[0].shape[1] != arrays[2].shape[1]):
+        raise ValueError("Nuisance input dimensions do not match")
+    if epochs < 1:
+        raise ValueError("Nuisance epochs must be positive")
+    if binary and any(not np.isin(v, [0, 1]).all() for v in (arrays[1], arrays[3])):
+        raise ValueError("Binary nuisance labels must be zero or one")
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
     Y_train_t = torch.tensor(Y_train, dtype=torch.float32).unsqueeze(1)
     X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
@@ -117,12 +128,16 @@ def train_nuisance_nn(
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad(set_to_none=True)
             loss = criterion(model(xb), yb)
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Nonfinite nuisance training loss")
             loss.backward()
             optimizer.step()
 
         model.eval()
         with torch.no_grad():
             val_loss = criterion(model(X_val_t), Y_val_t).item()
+        if not np.isfinite(val_loss):
+            raise FloatingPointError("Nonfinite nuisance validation loss")
 
         if scheduler is not None:
             scheduler.step()
@@ -280,7 +295,14 @@ def train_autoencoder(
     early_stop=True,
     verbose=False
 ):
-
+    for values in (X_train,) if X_val is None else (X_train, X_val):
+        values = np.asarray(values)
+        if values.ndim != 2 or not values.size or not np.isfinite(values).all():
+            raise ValueError("Autoencoder subsets must be nonempty finite matrices")
+    if epochs < 1 or latent_dim < 1:
+        raise ValueError("Autoencoder epochs and latent dimension must be positive")
+    if model_type.upper() not in {"AE", "VAE"}:
+        raise ValueError("model_type must be AE or VAE")
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
     if X_val is not None:
         X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
@@ -351,6 +373,8 @@ def train_autoencoder(
                 recon = model(xb)
                 loss = nn.functional.mse_loss(recon, xb)
 
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Nonfinite autoencoder training loss")
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * xb.size(0)
@@ -372,6 +396,8 @@ def train_autoencoder(
                         model(X_val_t), X_val_t
                     ).item()
 
+        if not np.isfinite(val_loss):
+            raise FloatingPointError("Nonfinite autoencoder checkpoint criterion")
         if scheduler is not None:
             scheduler.step()
 

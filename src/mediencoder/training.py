@@ -7,9 +7,9 @@
 #   1. Train with NORMALIZED losses:
 #        loss_X     / sd(X)^2
 #        loss_M     / sd(M)^2
-#        loss_align / sd(f_M)^2   if f_M_train is provided
-#                    / sd(M)^2    otherwise (real-data fallback)
-#   2. Early stopping is based on normalized weighted loss
+#        loss_align / sd(M_train)^2
+#      All scales use observed representation-training data only.
+#   2. Validation checkpointing uses reconstruction (+ KL for MediVAE).
 #   3. Rich history / metadata recording for later analysis
 #   4. Lambda helpers support:
 #        lambda1 + lambda2 + lambda3 = C
@@ -24,7 +24,7 @@ import torch.optim as optim
 
 from torch.utils.data import DataLoader, TensorDataset
 
-from nn_utils import build_mlp, device
+from mediencoder.nn_utils import build_mlp, device
 
 
 # ============================================================
@@ -466,40 +466,33 @@ def _safe_global_sd(arr, eps=1e-8):
     return max(sd, eps)
 
 
-def compute_loss_scales(X_train, M_train, f_M_train=None, eps=1e-8):
-    """
-    Return scales for normalized losses.
+def compute_loss_scales(X_train, M_train, eps=1e-8):
+    """Freeze global observed-data scales on the representation-training fold.
 
-    We normalize squared losses by variance-like quantities:
-        mse_X     / sd_X^2
-        mse_M     / sd_M^2
-        mse_align / sd_fM^2
-
-    If f_M_train is not available (real data), we fall back to M_train
-    for the align-loss scale.
+    Each loss is a mean over subjects AND coordinates. Alignment uses the
+    observed mediator variance in both simulation and real-data fits.
     """
+    for name, values in (("X_train", X_train), ("M_train", M_train)):
+        values = np.asarray(values)
+        if values.size == 0 or not np.all(np.isfinite(values)):
+            raise ValueError(f"{name} must contain finite observed values")
     sd_X = _safe_global_sd(X_train, eps=eps)
     sd_M = _safe_global_sd(M_train, eps=eps)
-
-    if f_M_train is None:
-        sd_fM = _safe_global_sd(M_train, eps=eps)
-    else:
-        sd_fM = _safe_global_sd(f_M_train, eps=eps)
-
-    scales = {
-        "sd_X": sd_X,
-        "sd_M": sd_M,
-        "sd_fM": sd_fM,
-        "var_X": sd_X ** 2,
-        "var_M": sd_M ** 2,
-        "var_fM": sd_fM ** 2
+    return {
+        "sd_X": sd_X, "sd_M": sd_M, "sd_align": sd_M,
+        "var_X": sd_X ** 2, "var_M": sd_M ** 2,
+        "var_align": sd_M ** 2,
     }
-    return scales
 
 
 # ============================================================
 # 4) Training
 # ============================================================
+
+def _alignment_loss(z_M, z_M_pred):
+    """Retained stop-gradient update: only the prediction branch receives gradients."""
+    return nn.functional.mse_loss(z_M.detach(), z_M_pred)
+
 
 def train_mediencoder(
     X_train,
@@ -508,11 +501,9 @@ def train_mediencoder(
     *,
     latent_p,
     latent_q,
-    f_M_train=None,
     X_val=None,
     M_val=None,
     A_val=None,
-    f_M_val=None,
     hidden_dims_X=(300, 300),
     hidden_dims_M=(300, 300),
     hidden_dims_XM=(50, 50),
@@ -549,15 +540,13 @@ def train_mediencoder(
     Objective:
         lambda1 * mse(X_recon, X) / sd(X)^2
       + lambda2 * mse(M_recon, M) / sd(M)^2
-      + lambda3 * mse(z_M, z_M_pred) / sd(f_M)^2
+      + lambda3 * mse(z_M, z_M_pred) / sd(M_train)^2
 
-    For real data, use f_M_train=None and the third term is normalized by sd(M)^2.
+    Alignment uses the observed M_train scale for every dataset.
 
-    Early stopping. If X_val, M_val and A_val are given, the checkpoint is chosen
-    on the held-out weighted loss, as train_autoencoder does with X_val.
-    Otherwise it falls back to the training weighted loss, which decreases
-    monotonically, so the checkpoint ends up at the last epoch -- in small
-    samples that is the overfitted iterate. Pass a validation set whenever one
+    If validation data are supplied, choose the checkpoint using weighted
+    reconstruction loss only, reusing the frozen training-fold scales.
+    Otherwise it falls back to the training weighted loss. Pass a validation set whenever one
     is available.
     """
 
@@ -581,11 +570,13 @@ def train_mediencoder(
                 "lambda2 > lambda1, lambda1 > 0, lambda2 > 0, lambda3 >= 0."
             )
 
-    scales = compute_loss_scales(X_train, M_train, f_M_train=f_M_train, eps=1e-8)
+    if epochs < 1:
+        raise ValueError("Training epochs must be positive")
+    scales = compute_loss_scales(X_train, M_train, eps=1e-8)
 
     var_X = scales["var_X"]
     var_M = scales["var_M"]
-    var_fM = scales["var_fM"]
+    var_align = scales["var_align"]
 
     X_t = torch.tensor(X_train, dtype=torch.float32)
     M_t = torch.tensor(M_train, dtype=torch.float32)
@@ -660,9 +651,6 @@ def train_mediencoder(
         X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
         M_val_t = torch.tensor(M_val, dtype=torch.float32).to(device)
         A_val_t = torch.tensor(A_val, dtype=torch.float32).to(device)
-        var_fM_val = var_fM
-        if f_M_val is not None:
-            var_fM_val = float(np.var(f_M_val)) + 1e-8
 
     for epoch in range(epochs):
         model.train()
@@ -698,11 +686,11 @@ def train_mediencoder(
             # to PREDICT the mediator code, not drag encoder_M's code down to be
             # predictable. Without detach the gradient collapses z_M's scale
             # (std ~0.2 vs ~2.7), destroying the arm-difference and the NIE.
-            raw_loss_align = mse_fn(z_M.detach(), z_M_pred)
+            raw_loss_align = _alignment_loss(z_M, z_M_pred)
 
             loss_X = raw_loss_X / var_X
             loss_M = raw_loss_M / var_M
-            loss_align = raw_loss_align / var_fM
+            loss_align = raw_loss_align / var_align
 
             weighted_loss = (
                 lambda1 * loss_X +
@@ -716,6 +704,8 @@ def train_mediencoder(
                 lambda3 * raw_loss_align
             )
 
+            if not torch.isfinite(weighted_loss):
+                raise FloatingPointError("Nonfinite coupled-encoder training loss")
             weighted_loss.backward()
             optimizer.step()
 
@@ -760,9 +750,8 @@ def train_mediencoder(
 
         history["lr"].append(current_lr)
 
-        # checkpoint criterion: held-out weighted loss when a validation set was
-        # supplied, otherwise the training weighted loss, which decreases
-        # monotonically
+        # Validation monitors reconstruction only, using frozen training scales.
+        # Without validation, retain the training-weighted-loss fallback.
         monitor = avg_weighted
         if use_val:
             model.eval()
@@ -770,9 +759,6 @@ def train_mediencoder(
                 out_v = model(X_val_t, M_val_t, A_val_t)
                 v_X = mse_fn(out_v["X_recon"], X_val_t).item() / var_X
                 v_M = mse_fn(out_v["M_recon"], M_val_t).item() / var_M
-                v_align = mse_fn(
-                    out_v["z_M"], out_v["z_M_pred"]
-                ).item() / var_fM_val
                 # Checkpoint on RECONSTRUCTION only. The align term is
                 # minimized by a near-init tiny-scale z_M, so including it
                 # makes early-stopping pick a collapsed encoder_M (best_ep~0)
@@ -781,6 +767,8 @@ def train_mediencoder(
                 monitor = lambda1 * v_X + lambda2 * v_M
             history["val_weighted_loss"].append(monitor)
 
+        if not np.isfinite(monitor):
+            raise FloatingPointError("Nonfinite coupled-encoder checkpoint criterion")
         if monitor < best_weighted_loss - min_delta:
             best_weighted_loss = monitor
             best_epoch = epoch
@@ -808,6 +796,9 @@ def train_mediencoder(
         model.load_state_dict(best_state)
 
     fit_info = {
+        "alignment_stop_gradient": True,
+        "scale_source": "observed_representation_training_fold",
+        "checkpoint_criterion": "reconstruction" if use_val else "training_weighted_loss",
         "lambda1": float(lambda1),
         "lambda2": float(lambda2),
         "lambda3": float(lambda3),
@@ -816,10 +807,10 @@ def train_mediencoder(
         "final_epoch": int(history["epoch"][-1]) if len(history["epoch"]) > 0 else -1,
         "sd_X": float(scales["sd_X"]),
         "sd_M": float(scales["sd_M"]),
-        "sd_fM": float(scales["sd_fM"]),
+        "sd_align": float(scales["sd_align"]),
         "var_X": float(scales["var_X"]),
         "var_M": float(scales["var_M"]),
-        "var_fM": float(scales["var_fM"]),
+        "var_align": float(scales["var_align"]),
         "best_loss_X": float(history["loss_X"][best_epoch]) if best_epoch >= 0 else np.nan,
         "best_loss_M": float(history["loss_M"][best_epoch]) if best_epoch >= 0 else np.nan,
         "best_loss_align": float(history["loss_align"][best_epoch]) if best_epoch >= 0 else np.nan,
@@ -909,8 +900,7 @@ def encode_with_mediencoder(
 def train_mediencoder_vae(
     X_train, M_train, A_train, *,
     latent_p, latent_q,
-    f_M_train=None,
-    X_val=None, M_val=None, A_val=None, f_M_val=None,
+    X_val=None, M_val=None, A_val=None,
     hidden_dims_X=(300, 300),
     hidden_dims_M=(300, 300),
     hidden_dims_XM=(50, 50),
@@ -945,10 +935,10 @@ def train_mediencoder_vae(
     Objective:
         lambda1 * mse(X_recon, X) / sd(X)^2
       + lambda2 * mse(M_recon, M) / sd(M)^2
-      + lambda3 * mse(z_M, z_M_pred) / sd(f_M)^2
+      + lambda3 * mse(z_M, z_M_pred) / sd(M_train)^2
       + beta_kl * (KL_X + KL_M)
 
-    For real data, use f_M_train=None and the alignment term is normalized by sd(M)^2.
+    Alignment uses the observed M_train scale for every dataset.
     """
 
     if allow_unbalanced_lambda:
@@ -971,11 +961,13 @@ def train_mediencoder_vae(
                 "lambda2 > lambda1, lambda1 > 0, lambda2 > 0, lambda3 >= 0."
             )
 
-    scales = compute_loss_scales(X_train, M_train, f_M_train=f_M_train, eps=1e-8)
+    if epochs < 1:
+        raise ValueError("Training epochs must be positive")
+    scales = compute_loss_scales(X_train, M_train, eps=1e-8)
 
     var_X = scales["var_X"]
     var_M = scales["var_M"]
-    var_fM = scales["var_fM"]
+    var_align = scales["var_align"]
 
     X_t = torch.tensor(X_train, dtype=torch.float32)
     M_t = torch.tensor(M_train, dtype=torch.float32)
@@ -1047,17 +1039,13 @@ def train_mediencoder_vae(
 
     mse_fn = nn.functional.mse_loss
 
-    # held-out monitor for early stopping / checkpointing. Without it the
-    # criterion is the training weighted loss, which decreases monotonically,
-    # so best_state is always the last (most overfitted) epoch.
+    # Validation monitors reconstruction plus KL, using frozen training scales.
+    # Without validation, retain the training-weighted-loss fallback.
     use_val = X_val is not None and M_val is not None and A_val is not None
     if use_val:
         X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
         M_val_t = torch.tensor(M_val, dtype=torch.float32).to(device)
         A_val_t = torch.tensor(A_val, dtype=torch.float32).to(device)
-        var_fM_val = var_fM
-        if f_M_val is not None:
-            var_fM_val = float(np.var(f_M_val)) + 1e-8
 
     for epoch in range(epochs):
         model.train()
@@ -1086,14 +1074,14 @@ def train_mediencoder_vae(
 
             raw_loss_X = mse_fn(out["X_recon"], xb)
             raw_loss_M = mse_fn(out["M_recon"], mb)
-            raw_loss_align = mse_fn(out["z_M"].detach(), out["z_M_pred"])  # detach target; see train_mediencoder
+            raw_loss_align = _alignment_loss(out["z_M"], out["z_M_pred"])
 
             kl_X = kl_divergence_standard_normal(out["mu_X"], out["logvar_X"])
             kl_M = kl_divergence_standard_normal(out["mu_M"], out["logvar_M"])
 
             loss_X = raw_loss_X / var_X
             loss_M = raw_loss_M / var_M
-            loss_align = raw_loss_align / var_fM
+            loss_align = raw_loss_align / var_align
 
             weighted_loss = (
                 lambda1 * loss_X +
@@ -1109,6 +1097,8 @@ def train_mediencoder_vae(
                 beta_kl * (kl_X + kl_M)
             )
 
+            if not torch.isfinite(weighted_loss):
+                raise FloatingPointError("Nonfinite coupled-encoder training loss")
             weighted_loss.backward()
             optimizer.step()
 
@@ -1159,8 +1149,7 @@ def train_mediencoder_vae(
 
         history["lr"].append(current_lr)
 
-        # checkpoint criterion: held-out weighted loss when a validation set
-        # was supplied, otherwise the training weighted loss
+        # Held-out reconstruction plus KL; otherwise the training weighted loss.
         monitor = avg_weighted
         if use_val:
             model.eval()
@@ -1171,12 +1160,8 @@ def train_mediencoder_vae(
                 mu_Mv = model.encode_M_mean(M_val_t)
                 Xv_recon = model.decoder_X(mu_Xv)
                 Mv_recon = model.decoder_M(mu_Mv)
-                zMv_pred = model.g_XM(
-                    torch.cat([A_val_t.unsqueeze(1), mu_Xv], dim=1)
-                )
                 v_X = mse_fn(Xv_recon, X_val_t).item() / var_X
                 v_M = mse_fn(Mv_recon, M_val_t).item() / var_M
-                v_align = mse_fn(mu_Mv, zMv_pred).item() / var_fM_val
                 # the KL block is part of the training objective, so keep it in
                 # the monitor as well
                 lv_Xv = model.logvar_X(model.encoder_X_backbone(X_val_t))
@@ -1192,6 +1177,8 @@ def train_mediencoder_vae(
                 )
             history["val_weighted_loss"].append(monitor)
 
+        if not np.isfinite(monitor):
+            raise FloatingPointError("Nonfinite coupled-encoder checkpoint criterion")
         if monitor < best_weighted_loss - min_delta:
             best_weighted_loss = monitor
             best_epoch = epoch
@@ -1221,6 +1208,9 @@ def train_mediencoder_vae(
         model.load_state_dict(best_state)
 
     fit_info = {
+        "alignment_stop_gradient": True,
+        "scale_source": "observed_representation_training_fold",
+        "checkpoint_criterion": "reconstruction_plus_kl" if use_val else "training_weighted_loss",
         "lambda1": float(lambda1),
         "lambda2": float(lambda2),
         "lambda3": float(lambda3),
@@ -1230,10 +1220,10 @@ def train_mediencoder_vae(
         "final_epoch": int(history["epoch"][-1]) if len(history["epoch"]) > 0 else -1,
         "sd_X": float(scales["sd_X"]),
         "sd_M": float(scales["sd_M"]),
-        "sd_fM": float(scales["sd_fM"]),
+        "sd_align": float(scales["sd_align"]),
         "var_X": float(scales["var_X"]),
         "var_M": float(scales["var_M"]),
-        "var_fM": float(scales["var_fM"]),
+        "var_align": float(scales["var_align"]),
         "best_loss_X": float(history["loss_X"][best_epoch]) if best_epoch >= 0 else np.nan,
         "best_loss_M": float(history["loss_M"][best_epoch]) if best_epoch >= 0 else np.nan,
         "best_loss_align": float(history["loss_align"][best_epoch]) if best_epoch >= 0 else np.nan,

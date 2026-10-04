@@ -15,6 +15,7 @@
 
 import copy
 import warnings
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -22,15 +23,14 @@ from sklearn.model_selection import train_test_split
 from scipy.linalg import svd
 from scipy.stats import norm
 
-from DGP_and_estimate import get_f_hat
-from NNModel_and_Train import (
+from mediencoder.models import (
     train_nuisance_nn,
     predict_nn,
     train_autoencoder,
     encode_with_autoencoder
 )
 
-from MediEncoder_and_Train import (
+from mediencoder.training import (
     train_mediencoder,
     encode_with_mediencoder,
     train_mediencoder_vae,
@@ -65,6 +65,8 @@ def _fit_projection(Z_train: np.ndarray, tilde: int):
     p = Z_train.shape[1]
     _, _, Vt = svd(Z_train, full_matrices=False)
     V = Vt.T[:, :tilde]
+    if V.shape[1] != tilde:
+        raise ValueError("Projection dimension exceeds the available training rank/dimension")
     W = np.sqrt(p) * V
     return W
 
@@ -111,6 +113,53 @@ def _split_nuisance_fold(nuisance_idx, A, *, val_ratio=0.25, seed=42):
 
 def _safe_clip_prob(x, eps=1e-2):
     return np.clip(x, eps, 1 - eps)
+
+
+def _clip_eps():
+    # Overlap floor for the two fitted propensities. 1e-2 is the historical default;
+    # MEDIENC_CLIP_EPS raises it, which is the standard way to keep the inverse-
+    # probability weights from being driven by a handful of near-deterministic units.
+    return _os_env_float("MEDIENC_CLIP_EPS", 1e-2)
+
+
+def _os_env_float(name, default):
+    import os as _os
+    try:
+        return float(_os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _resolve_numerical_safeguards(settings=None):
+    """Resolve once per analysis; explicit settings never inherit environment."""
+    if settings is None:
+        settings = {"clip_eps": _clip_eps(),
+                    "pi2_soft": _os_env_float("MEDIENC_PI2_SOFT", 0.0),
+                    "pi2_cap": _os_env_float("MEDIENC_PI2_CAP", 0.0)}
+    else:
+        if not isinstance(settings, dict) or set(settings) - {"clip_eps", "pi2_soft", "pi2_cap"}:
+            raise ValueError("Unknown numerical safeguard settings")
+        settings = {"clip_eps": 1e-2, "pi2_soft": 0.0, "pi2_cap": 0.0, **settings}
+    settings = {key: float(value) for key, value in settings.items()}
+    if not all(np.isfinite(value) for value in settings.values()):
+        raise ValueError("Numerical safeguards must be finite")
+    if not 0 < settings["clip_eps"] < .5:
+        raise ValueError("clip_eps must be strictly between zero and one half")
+    if settings["pi2_soft"] < 0 or settings["pi2_cap"] < 0:
+        raise ValueError("Density-ratio safeguards cannot be negative")
+    if settings["pi2_soft"] > 0 and settings["pi2_cap"] > 0:
+        raise ValueError("Specify at most one density-ratio safeguard")
+    return settings
+
+
+def _is_resource_exhaustion(error):
+    """A hardware failure must not shrink the scientific tuning grid."""
+    if isinstance(error, (MemoryError, torch.cuda.OutOfMemoryError)):
+        return True
+    message = str(error).lower()
+    return isinstance(error, RuntimeError) and any(term in message for term in (
+        "out of memory", "cannot allocate memory", "can't allocate memory",
+        "not enough memory", "cublas_status_alloc_failed", "cudnn_status_alloc_failed"))
 
 
 # The methods whose objective carries the (lambda1, lambda2, lambda3) weights.
@@ -173,8 +222,10 @@ def _fit_nuisances_and_eval_theta(
     subtrain_idx,
     val_idx,
     target_idx,
-    nn_cfg=None
+    nn_cfg=None,
+    numerical_safeguards=None,
 ):
+    safeguards = _resolve_numerical_safeguards(numerical_safeguards)
     nn_cfg = {} if nn_cfg is None else dict(nn_cfg)
     # train_nuisance_nn has no min_delta argument (its improvement threshold is
     # hard-coded to 1e-4, the shared value), so drop the key if the caller's cfg
@@ -193,7 +244,7 @@ def _fit_nuisances_and_eval_theta(
     )
 
     e_hat = predict_nn(e_model, f_X_all[target_idx], binary=True)
-    e_hat = _safe_clip_prob(e_hat, eps=1e-2)
+    e_hat = _safe_clip_prob(e_hat, eps=safeguards["clip_eps"])
 
     # mu1(X,M) on treated
     treated_sub = (A[subtrain_idx] == 1)
@@ -270,10 +321,29 @@ def _fit_nuisances_and_eval_theta(
         np.hstack([f_X_all[target_idx], f_M_all[target_idx]]),
         binary=True
     )
-    post = _safe_clip_prob(post, eps=1e-2)
-    prior = _safe_clip_prob(e_hat, eps=1e-2)
+    post = _safe_clip_prob(post, eps=safeguards["clip_eps"])
+    prior = _safe_clip_prob(e_hat, eps=safeguards["clip_eps"])
 
     pi2_hat = ((1 - post) / post) * (prior / (1 - prior))
+
+    # Overlap truncation on the cross-world density ratio. pi2 is a ratio of two
+    # fitted odds, so a single near-deterministic mediator propensity sends it to
+    # O(1e3) and one such unit dominates the whole EIF average (measured: median
+    # max pi2 = 166, worst rep 1191, and the untruncated per-replication SD is 5x
+    # the truncated one). Capping it is the standard overlap-trimming step; the
+    # cap is a quantile of the within-fold ratio when MEDIENC_PI2_CAP is given as
+    # a value in (0, 1] (read as a percentile), and a hard constant otherwise.
+    # MEDIENC_PI2_SOFT = c applies the smooth cap pi2 / (1 + pi2 / c), which is
+    # monotone, tends to c, and leaves the bulk of the ratio almost untouched, so it
+    # buys the same variance reduction as a hard cut at a fraction of the truncation
+    # bias (hard cut at 10 leaves bias -0.27 at n = 1500; the soft version does not).
+    _soft = safeguards["pi2_soft"]
+    _cap = safeguards["pi2_cap"]
+    if _soft > 0.0:
+        pi2_hat = pi2_hat / (1.0 + pi2_hat / _soft)
+    elif _cap > 0.0:
+        thr = np.percentile(pi2_hat, 100.0 * _cap) if _cap <= 1.0 else _cap
+        pi2_hat = np.minimum(pi2_hat, thr)
 
     # IF
     A_tar = A[target_idx]
@@ -293,6 +363,7 @@ def _fit_nuisances_and_eval_theta(
         "theta_hat_mu10": theta_hat_mu10,
         "mu1_model": mu1_model,
         "phi": np.asarray(phi, dtype=float),
+        "propensity": np.asarray(e_hat, dtype=float),
     }
 
 
@@ -530,6 +601,97 @@ def _merge_method_cfg(cfg, defaults, *, method):
     return cfg
 
 
+def _preprocess_representation_inputs(X, M, train_idx, *, mode="none"):
+    """Fit input transformations exclusively on representation-training rows."""
+    if mode == "none":
+        return X, M, {"mode": "none"}
+    if mode != "standardize":
+        raise ValueError("Unknown preprocessing mode")
+    transformed, metadata = [], {"mode": mode, "fit_rows": np.asarray(train_idx).copy()}
+    for name, data in (("X", X), ("M", M)):
+        data = np.asarray(data, dtype=float)
+        train = data[train_idx]
+        mean, scale = train.mean(axis=0), train.std(axis=0)
+        if not np.all(np.isfinite(mean)) or not np.all(np.isfinite(scale)):
+            raise ValueError("Nonfinite preprocessing statistics")
+        # Constant features remain zero on the training fold; do not divide by zero.
+        constant = scale <= 1e-8
+        scale = np.where(constant, 1., scale)
+        transformed.append((data - mean) / scale)
+        metadata[name] = {"mean": mean, "scale": scale, "constant_columns": np.flatnonzero(constant)}
+    return transformed[0], transformed[1], metadata
+
+
+@contextmanager
+def _isolated_random_state(seed):
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_initialized() else []
+    try:
+        with torch.random.fork_rng(devices=devices):
+            set_all_seeds(seed)
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+
+
+def _fit_marginal_outcome_scores(f_X, A, Y, train_idx, val_idx, target_idx, propensity, *, nn_cfg=None):
+    """AIPW scores for E[Y(1)] and E[Y(0)], conditioning only on pretreatment factors.
+
+    Using mu_a(f_X, f_M) at the observed post-treatment mediator here would not
+    integrate the mediator under intervention a and would target another quantity.
+    """
+    config = {} if nn_cfg is None else dict(nn_cfg)
+    if config.pop("min_delta", 1e-4) != 1e-4:
+        raise ValueError("Nuisance improvement threshold must be 1e-4")
+    config["binary"] = False
+    propensity = np.asarray(propensity, dtype=float)
+    if propensity.shape != (len(target_idx),) or not np.all(np.isfinite(propensity)) or np.any((propensity <= 0) | (propensity >= 1)):
+        raise ValueError("Marginal scores require finite overlap propensities")
+    scores = {}
+    for arm, key in ((1, "theta11"), (0, "theta00")):
+        train_arm = train_idx[A[train_idx] == arm]
+        val_arm = val_idx[A[val_idx] == arm]
+        if len(train_arm) == 0 or len(val_arm) == 0:
+            raise ValueError(f"Nuisance training/validation fold lacks treatment arm {arm}")
+        model, *_ = train_nuisance_nn(f_X[train_arm], Y[train_arm],
+                                     f_X[val_arm], Y[val_arm], **config)
+        mean = np.asarray(predict_nn(model, f_X[target_idx], binary=False), dtype=float)
+        if mean.shape != (len(target_idx),) or not np.all(np.isfinite(mean)):
+            raise ValueError("Nonfinite or invalid marginal-outcome predictions")
+        probability = propensity if arm == 1 else 1. - propensity
+        scores[key] = mean + (A[target_idx] == arm) / probability * (Y[target_idx] - mean)
+        if not np.all(np.isfinite(scores[key])):
+            raise ValueError("Nonfinite marginal-outcome score")
+    return scores
+
+
+def summarize_effect_scores(theta11, theta10, theta00):
+    """Compute matched-subject contrasts and their covariance of sample means."""
+    arrays = [np.asarray(v, dtype=float) for v in (theta11, theta10, theta00)]
+    if any(v.ndim != 1 for v in arrays) or len(arrays[0]) < 2 or any(v.shape != arrays[0].shape for v in arrays):
+        raise ValueError("Component scores must be matching vectors with at least two subjects")
+    if not all(np.all(np.isfinite(v)) for v in arrays):
+        raise ValueError("All component scores must be finite; no subjects are dropped")
+    s11, s10, s00 = arrays
+    order = ["NIE", "NDE", "TE"]
+    matrix = np.column_stack((s11-s10, s10-s00, s11-s00))
+    covariance = np.cov(matrix, rowvar=False, ddof=1) / len(s11)
+    means, errors = matrix.mean(axis=0), np.sqrt(np.diag(covariance))
+    if not np.all(np.isfinite(covariance)):
+        raise ValueError("Nonfinite effect covariance")
+    z = 1.959963984540054
+    return {
+        "effects": dict(zip(order, map(float, means))),
+        "effect_se": dict(zip(order, map(float, errors))),
+        "effect_ci": {key: [float(means[j]-z*errors[j]), float(means[j]+z*errors[j])] for j, key in enumerate(order)},
+        "effect_scores": {key: matrix[:, j].copy() for j, key in enumerate(order)},
+        "effect_covariance": covariance, "effect_order": order,
+        "component_scores": dict(zip(["theta11", "theta10", "theta00"], arrays)),
+        "component_means": dict(zip(["theta11", "theta10", "theta00"], [float(v.mean()) for v in arrays])),
+    }
+
+
 def _learn_representations_fixed_split(
     X,
     M,
@@ -544,8 +706,8 @@ def _learn_representations_fixed_split(
     ae_cfg=None,
     me_cfg=None,
     encode_cfg=None,
-    f_M_true_all=None,
-    nn_cfg=None
+    nn_cfg=None,
+    preprocessing="none",
 ):
     factor_method = factor_method.lower()
     ae_cfg = {} if ae_cfg is None else dict(ae_cfg)
@@ -553,6 +715,8 @@ def _learn_representations_fixed_split(
     encode_cfg = {} if encode_cfg is None else dict(encode_cfg)
 
     encode_cfg.setdefault("batch_size", 4096)
+    X, M, preprocessing_info = _preprocess_representation_inputs(
+        X, M, subtrain_idx, mode=preprocessing)
 
     if factor_method == "projection":
         trainval_idx = np.concatenate([subtrain_idx, val_idx])
@@ -597,10 +761,15 @@ def _learn_representations_fixed_split(
         # beta itself) is what puts VAE and MediEncoder on the identical selection
         # rule. VAE-only knob; ignored by the AE branch (model_type == "AE").
         beta_grid = ae_cfg.pop("beta_kl_grid", None)
+        beta_rows = None
         if beta_grid is not None and model_type == "VAE":
-            beta_grid = list(beta_grid)
+            beta_grid = [float(value) for value in beta_grid]
+            if not beta_grid or any(not np.isfinite(value) or value < 0 for value in beta_grid):
+                raise ValueError("beta_kl_grid must contain finite nonnegative candidates")
+            beta_rows = []
             best_beta, best_beta_score = None, np.inf
             for cand_beta in beta_grid:
+                failure = None
                 try:
                     trial_cfg = dict(ae_cfg)
                     trial_cfg["beta_kl"] = float(cand_beta)
@@ -621,12 +790,22 @@ def _learn_representations_fixed_split(
                         nn_cfg=dict({} if nn_cfg is None else nn_cfg)
                     ) if Y is not None else {"prediction_mse": np.inf}
                     score = float(pe["prediction_mse"])
-                except Exception:
+                    if not np.isfinite(score):
+                        failure = {"type": "NonfinitePredictionError", "message": "Candidate prediction MSE is not finite"}
+                except Exception as exc:
                     score = np.inf
+                    failure = {"type": type(exc).__name__, "message": str(exc)}
+                    if _is_resource_exhaustion(exc):
+                        exc.tuning_rows = beta_rows + [{"beta_kl": cand_beta, "prediction_mse": score, "failure": failure}]
+                        raise
+                beta_rows.append({"beta_kl": cand_beta, "prediction_mse": score, "failure": failure})
                 if np.isfinite(score) and score < best_beta_score:
                     best_beta_score, best_beta = score, float(cand_beta)
             if best_beta is None:
-                best_beta = float(beta_grid[0])
+                examples = [row["failure"] for row in beta_rows if row["failure"] is not None][:3]
+                error = RuntimeError(f"All {len(beta_rows)} beta candidates failed on this fold; examples: {examples}")
+                error.tuning_rows = beta_rows
+                raise error
             ae_cfg["beta_kl"] = best_beta
             rep_selected_beta = best_beta
         else:
@@ -670,6 +849,8 @@ def _learn_representations_fixed_split(
         )
 
         rep_fit_info = {"method": factor_method, "selected_beta_kl": rep_selected_beta}
+        if beta_rows is not None:
+            rep_fit_info["beta_tuning_rows"] = beta_rows
         rep_history = None
         rep_model = (ae_X, ae_M)
 
@@ -683,18 +864,12 @@ def _learn_representations_fixed_split(
             lambda2=0.5,
             lambda3=0.3,
             return_history=True,
-            # early stopping on the held-out weighted loss, as the autoencoder
-            # branch does. Set False to checkpoint on the training loss instead.
+            # Held-out reconstruction checkpointing. Set False to monitor the
+            # training-weighted loss instead.
             use_val=True,
         )
         
         me_cfg = _merge_method_cfg(me_cfg, me_defaults, method="mediencoder")
-
-        f_M_train = None
-        f_M_val = None
-        if f_M_true_all is not None:
-            f_M_train = f_M_true_all[subtrain_idx]
-            f_M_val = f_M_true_all[val_idx]
 
         me_use_val = bool(me_cfg["use_val"])
 
@@ -704,11 +879,9 @@ def _learn_representations_fixed_split(
             A[subtrain_idx],
             latent_p=tilde_p,
             latent_q=tilde_q,
-            f_M_train=f_M_train,
             X_val=X[val_idx] if me_use_val else None,
             M_val=M[val_idx] if me_use_val else None,
             A_val=A[val_idx] if me_use_val else None,
-            f_M_val=f_M_val if me_use_val else None,
             hidden_dims_X=me_cfg["hidden_dims_X"],
             hidden_dims_M=me_cfg["hidden_dims_M"],
             hidden_dims_XM=me_cfg["hidden_dims_XM"],
@@ -776,12 +949,6 @@ def _learn_representations_fixed_split(
         )
         me_cfg = _merge_method_cfg(me_cfg, mv_defaults, method="medivae")
 
-        f_M_train = None
-        f_M_val = None
-        if f_M_true_all is not None:
-            f_M_train = f_M_true_all[subtrain_idx]
-            f_M_val = f_M_true_all[val_idx]
-
         mv_use_val = bool(me_cfg["use_val"])
 
         mv_model, mv_history, mv_fit_info = train_mediencoder_vae(
@@ -790,11 +957,9 @@ def _learn_representations_fixed_split(
             A[subtrain_idx],
             latent_p=tilde_p,
             latent_q=tilde_q,
-            f_M_train=f_M_train,
             X_val=X[val_idx] if mv_use_val else None,
             M_val=M[val_idx] if mv_use_val else None,
             A_val=A[val_idx] if mv_use_val else None,
-            f_M_val=f_M_val if mv_use_val else None,
             hidden_dims_X=me_cfg["hidden_dims_X"],
             hidden_dims_M=me_cfg["hidden_dims_M"],
             hidden_dims_XM=me_cfg["hidden_dims_XM"],
@@ -842,7 +1007,9 @@ def _learn_representations_fixed_split(
         "f_M_all": f_M_all,
         "rep_fit_info": rep_fit_info,
         "rep_history": rep_history,
-        "rep_model": rep_model
+        "rep_model": rep_model,
+        "resolved_config": dict(me_cfg if factor_method in _LAMBDA_METHODS else ae_cfg),
+        "preprocessing": preprocessing_info,
     }
 
 def _merge_rep_fit_info(info_a, info_b):
@@ -914,8 +1081,8 @@ def _select_lambda_for_fold(
     ae_cfg=None,
     me_cfg=None,
     encode_cfg=None,
-    f_M_true_all=None,
-    seed=42
+    seed=42,
+    preprocessing="none",
 ):
     """
     Algorithm 2 for ONE fold: select lambda using only (I_tr, I_val).
@@ -937,6 +1104,7 @@ def _select_lambda_for_fold(
         cand_cfg["lambda1"], cand_cfg["lambda2"], cand_cfg["lambda3"] = lam
         cand_cfg.setdefault("allow_unbalanced_lambda", True)
 
+        failure = None
         try:
             rep = _learn_representations_fixed_split(
                 X, M, A,
@@ -949,8 +1117,8 @@ def _select_lambda_for_fold(
                 ae_cfg=ae_cfg,
                 me_cfg=cand_cfg,
                 encode_cfg=encode_cfg,
-                                f_M_true_all=f_M_true_all,
-                nn_cfg=nn_cfg
+                nn_cfg=nn_cfg,
+                preprocessing=preprocessing,
             )
             pe = _fit_outcome_predictor_and_eval(
                 rep["f_X_all"], rep["f_M_all"], A, Y,
@@ -959,21 +1127,72 @@ def _select_lambda_for_fold(
                 nn_cfg=dict({} if nn_cfg is None else nn_cfg)
             )
             score = float(pe["prediction_mse"])
-        except Exception:
-            # A candidate that cannot be fit loses; it must not abort the fold.
+            if not np.isfinite(score):
+                failure = {"type": "NonfinitePredictionError", "message": "Candidate prediction MSE is not finite"}
+        except Exception as exc:
+            # Failed candidates lose, and their causes are saved in tuning rows.
             score = np.inf
+            failure = {"type": type(exc).__name__, "message": str(exc)}
+            if _is_resource_exhaustion(exc):
+                exc.tuning_rows = rows + [{"lambda1": lam[0], "lambda2": lam[1], "lambda3": lam[2],
+                                          "prediction_mse": score, "failure": failure}]
+                raise
 
         rows.append({"lambda1": lam[0], "lambda2": lam[1], "lambda3": lam[2],
-                     "prediction_mse": score})
+                     "prediction_mse": score, "failure": failure})
 
         if np.isfinite(score) and score < best_score:
             best_score, best = score, lam
 
     if best is None:
-        raise RuntimeError(
-            "every lambda candidate failed on this fold; no selection possible."
+        examples = [row["failure"] for row in rows if row["failure"] is not None][:3]
+        error = RuntimeError(
+            f"All {len(rows)} lambda candidates failed on this fold; examples: {examples}"
         )
+        error.tuning_rows = rows
+        raise error
     return best, rows
+
+
+def _aggregate_crossfit_scores(n, estimation_indices, fold_outputs):
+    """Validate once-only cross-fitting and compute dataset-specific inference.
+
+    Scores are uncentered, and are returned in original subject order. No
+    observation or nonfinite score is dropped from the inferential sample.
+    """
+    if n < 2 or len(estimation_indices) != len(fold_outputs):
+        raise ValueError("Invalid cross-fit aggregation inputs")
+    scores = np.empty(n, dtype=float)
+    seen = np.zeros(n, dtype=int)
+    weighted_theta = 0.0
+    for indices, result in zip(estimation_indices, fold_outputs):
+        indices = np.asarray(indices)
+        phi = np.asarray(result["phi"], dtype=float)
+        if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+            raise ValueError("Estimation indices must be one-dimensional integers")
+        if not len(indices) or np.any(indices < 0) or np.any(indices >= n):
+            raise ValueError("Empty or out-of-range estimation fold")
+        if phi.ndim != 1 or len(phi) != len(indices):
+            raise ValueError("Each estimation observation must have one score")
+        if not np.all(np.isfinite(phi)):
+            raise ValueError("Nonfinite cross-fit score; replication must fail")
+        theta = float(result["theta_hat_IF"])
+        if not np.isfinite(theta) or not np.isclose(theta, phi.mean(), rtol=1e-12, atol=1e-12):
+            raise ValueError("Fold estimate does not equal its score mean")
+        np.add.at(seen, indices, 1)
+        scores[indices] = phi
+        weighted_theta += len(indices) * theta / n
+    if not np.all(seen == 1):
+        raise ValueError("Estimation folds must cover each subject exactly once")
+    theta = float(scores.mean())
+    if not np.isclose(theta, weighted_theta, rtol=1e-12, atol=1e-12):
+        raise ValueError("Pooled score mean differs from size-weighted estimate")
+    se = float(np.sqrt(np.sum((scores - theta) ** 2) / (n * (n - 1))))
+    if not np.isfinite(se):
+        raise ValueError("Nonfinite cross-fit standard error")
+    z = 1.959963984540054
+    return dict(theta_hat_IF=theta, crossfit_scores=scores, n_scores=n,
+                se_IF=se, ci_lower=float(theta-z*se), ci_upper=float(theta+z*se))
 
 
 def estimate_triply_IF(
@@ -987,9 +1206,10 @@ def estimate_triply_IF(
     me_cfg=None,
     encode_cfg=None,
     seed=42,
-    f_M_true_all=None,
-    mu10_true_vals=None,
-    lambda_grid=None
+    lambda_grid=None,
+    return_effects=False,
+    preprocessing="none",
+    numerical_safeguards=None,
 ):
     """
     Algorithm 1: cross-fitted estimation of theta_0 = E[Y(1, M(0))].
@@ -1008,10 +1228,44 @@ def estimate_triply_IF(
 
     lambda_grid (Algorithm 1, step 4): when given, lambda is selected SEPARATELY
     for each representation half from its own (I_tr, I_val) via Algorithm 2. Pass
-    None for methods that have no lambda (projection, oracle, autoencoder, vae).
+    None for methods that have no lambda (projection, autoencoder, vae).
     """
+    X, M, A, Y = map(np.asarray, (X, M, A, Y))
+    if X.ndim != 2 or M.ndim != 2 or A.ndim != 1 or Y.ndim != 1:
+        raise ValueError("X/M must be matrices and A/Y must be vectors")
+    if X.shape[1] == 0 or M.shape[1] == 0:
+        raise ValueError("X and M must each contain at least one feature")
+    for name, dimension in (("tilde_p", tilde_p), ("tilde_q", tilde_q)):
+        if isinstance(dimension, (bool, np.bool_)) or not isinstance(dimension, (int, np.integer)) or dimension <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if preprocessing not in {"none", "standardize"}:
+        raise ValueError("preprocessing must be 'none' or 'standardize'")
+    safeguards = _resolve_numerical_safeguards(numerical_safeguards)
     n = X.shape[0]
+    if n < 4 or any(len(v) != n for v in (M, A, Y)):
+        raise ValueError("Observed arrays must have the same length, at least four")
+    if not all(np.all(np.isfinite(v)) for v in (X, M, A, Y)):
+        raise ValueError("Observed inputs must all be finite")
+    if not np.all(np.isin(A, [0, 1])):
+        raise ValueError("Treatment A must be binary")
+    factor_method = factor_method.lower()
+    if factor_method in _LAMBDA_METHODS:
+        if lambda_grid is None:
+            raise ValueError("MediEncoder/MediVAE requires a tuning grid")
+        _check_lambda_grid_wellposed(lambda_grid)
+    elif lambda_grid is not None:
+        raise ValueError("This representation method does not use a lambda grid")
     I1, I2, I3, I4 = _split_indices_4fold(n, seed=seed + 999)
+    fold_indices = [
+        dict(representation_train=I1, representation_validation=I2, nuisance=I3, estimation=I4),
+        dict(representation_train=I1, representation_validation=I2, nuisance=I4, estimation=I3),
+        dict(representation_train=I3, representation_validation=I4, nuisance=I1, estimation=I2),
+        dict(representation_train=I3, representation_validation=I4, nuisance=I2, estimation=I1),
+    ]
+    for roles in fold_indices:
+        joined = np.concatenate(list(roles.values()))
+        if len(joined) != n or not np.array_equal(np.sort(joined), np.arange(n)):
+            raise ValueError("Cross-fit fold roles must partition all subjects")
 
     tuning = {}
 
@@ -1028,7 +1282,7 @@ def estimate_triply_IF(
             lambda_grid=lambda_grid, subtrain_idx=I1, val_idx=I2,
             nn_cfg=nn_cfg, ae_cfg=ae_cfg, me_cfg=me_cfg,
             encode_cfg=encode_cfg,
-            f_M_true_all=f_M_true_all, seed=seed + 1000
+            seed=seed + 1000, preprocessing=preprocessing,
         )
         me_cfg_A = dict({} if me_cfg is None else me_cfg)
         me_cfg_A["lambda1"], me_cfg_A["lambda2"], me_cfg_A["lambda3"] = lam_A
@@ -1048,8 +1302,8 @@ def estimate_triply_IF(
         ae_cfg=ae_cfg,
         me_cfg=me_cfg_A,
         encode_cfg=encode_cfg,
-                f_M_true_all=f_M_true_all,
-        nn_cfg=nn_cfg
+        nn_cfg=nn_cfg,
+        preprocessing=preprocessing,
     )
 
     fX_A = rep_A["f_X_all"]
@@ -1057,22 +1311,28 @@ def estimate_triply_IF(
 
     # Fold 1
     nuis_tr, nuis_val = _split_nuisance_fold(I3, A, seed=seed)
+    fold_indices[0]["nuisance_train"] = nuis_tr
+    fold_indices[0]["nuisance_validation"] = nuis_val
     out_1 = _fit_nuisances_and_eval_theta(
         fX_A, fM_A, A, Y,
         subtrain_idx=nuis_tr,
         val_idx=nuis_val,
         target_idx=I4,
-        nn_cfg=nn_cfg
+        nn_cfg=nn_cfg,
+        numerical_safeguards=safeguards,
     )
 
     # Fold 2
     nuis_tr, nuis_val = _split_nuisance_fold(I4, A, seed=seed+1)
+    fold_indices[1]["nuisance_train"] = nuis_tr
+    fold_indices[1]["nuisance_validation"] = nuis_val
     out_2 = _fit_nuisances_and_eval_theta(
         fX_A, fM_A, A, Y,
         subtrain_idx=nuis_tr,
         val_idx=nuis_val,
         target_idx=I3,
-        nn_cfg=nn_cfg
+        nn_cfg=nn_cfg,
+        numerical_safeguards=safeguards,
     )
 
     # =========================
@@ -1088,7 +1348,7 @@ def estimate_triply_IF(
             lambda_grid=lambda_grid, subtrain_idx=I3, val_idx=I4,
             nn_cfg=nn_cfg, ae_cfg=ae_cfg, me_cfg=me_cfg,
             encode_cfg=encode_cfg,
-            f_M_true_all=f_M_true_all, seed=seed + 2000
+            seed=seed + 2000, preprocessing=preprocessing,
         )
         me_cfg_B = dict({} if me_cfg is None else me_cfg)
         me_cfg_B["lambda1"], me_cfg_B["lambda2"], me_cfg_B["lambda3"] = lam_B
@@ -1108,8 +1368,8 @@ def estimate_triply_IF(
         ae_cfg=ae_cfg,
         me_cfg=me_cfg_B,
         encode_cfg=encode_cfg,
-                f_M_true_all=f_M_true_all,
-        nn_cfg=nn_cfg
+        nn_cfg=nn_cfg,
+        preprocessing=preprocessing,
     )
 
     fX_B = rep_B["f_X_all"]
@@ -1117,22 +1377,28 @@ def estimate_triply_IF(
 
     # Fold 3
     nuis_tr, nuis_val = _split_nuisance_fold(I1, A, seed=seed+2)
+    fold_indices[2]["nuisance_train"] = nuis_tr
+    fold_indices[2]["nuisance_validation"] = nuis_val
     out_3 = _fit_nuisances_and_eval_theta(
         fX_B, fM_B, A, Y,
         subtrain_idx=nuis_tr,
         val_idx=nuis_val,
         target_idx=I2,
-        nn_cfg=nn_cfg
+        nn_cfg=nn_cfg,
+        numerical_safeguards=safeguards,
     )
 
     # Fold 4
     nuis_tr, nuis_val = _split_nuisance_fold(I2, A, seed=seed+3)
+    fold_indices[3]["nuisance_train"] = nuis_tr
+    fold_indices[3]["nuisance_validation"] = nuis_val
     out_4 = _fit_nuisances_and_eval_theta(
         fX_B, fM_B, A, Y,
         subtrain_idx=nuis_tr,
         val_idx=nuis_val,
         target_idx=I1,
-        nn_cfg=nn_cfg
+        nn_cfg=nn_cfg,
+        numerical_safeguards=safeguards,
     )
     
     pred_1 = _fit_outcome_predictor_and_eval(
@@ -1163,39 +1429,9 @@ def estimate_triply_IF(
         out_4["theta_hat_IF"]
     ]
 
-    # Algorithm 1, final step: theta_hat = sum_k (|I_est^(k)| / n) * theta_hat_k.
-    # np.array_split gives folds differing by at most one observation, so the
-    # unweighted mean this used to take is only equal to the weighted one when
-    # n % 4 == 0. The weights are the estimation-fold sizes, in the k = 1..4
-    # order of the table: I4, I3, I2, I1.
-    est_sizes = np.array([len(I4), len(I3), len(I2), len(I1)], dtype=float)
-    assert est_sizes.sum() == n, (est_sizes, n)
-    theta_hat = float(np.dot(est_sizes / n, np.asarray(theta_list, dtype=float)))
-
-    # Cross-fitted EIF-based standard error and 95% CI.
-    # Pool the per-sample influence values across the four folds; the
-    # variance of the mediation functional estimate is Var(phi)/n_total.
-    phi_pooled = np.concatenate([
-        out_1.get("phi", np.array([])),
-        out_2.get("phi", np.array([])),
-        out_3.get("phi", np.array([])),
-        out_4.get("phi", np.array([])),
-    ])
-    phi_pooled = phi_pooled[np.isfinite(phi_pooled)]
-    n_phi = phi_pooled.size
-    if n_phi > 1:
-        se_IF = float(np.std(phi_pooled, ddof=1) / np.sqrt(n_phi))
-        ci_lower = float(theta_hat - 1.959963984540054 * se_IF)
-        ci_upper = float(theta_hat + 1.959963984540054 * se_IF)
-    else:
-        se_IF = np.nan
-        ci_lower = np.nan
-        ci_upper = np.nan
-
-    if mu10_true_vals is not None:
-        theta_true = float(np.mean(mu10_true_vals))
-    else:
-        theta_true = np.nan
+    inference = _aggregate_crossfit_scores(
+        n, [I4, I3, I2, I1], [out_1, out_2, out_3, out_4])
+    est_sizes = [len(I4), len(I3), len(I2), len(I1)]
 
     rep_fit_info = _merge_rep_fit_info(
         rep_A.get("rep_fit_info", None),
@@ -1203,14 +1439,28 @@ def estimate_triply_IF(
         )
 
     out = {
-        "theta_hat_IF": float(theta_hat),
-        "theta_true": float(theta_true),
+        **inference,
         "fold_thetas": theta_list,
         "fold_est_sizes": [int(v) for v in est_sizes],
-        "se_IF": se_IF,
-        "ci_lower": ci_lower,
-        "ci_upper": ci_upper,
         "rep_fit_info": rep_fit_info,
+        "rep_fit_info_by_half": {"A": rep_A.get("rep_fit_info"), "B": rep_B.get("rep_fit_info")},
+        "fold_indices": fold_indices,
+        "resolved_config": {
+            "representation_A": rep_A.get("resolved_config", {}),
+            "representation_B": rep_B.get("resolved_config", {}),
+            "preprocessing_A": rep_A.get("preprocessing", {"mode": preprocessing}),
+            "preprocessing_B": rep_B.get("preprocessing", {"mode": preprocessing}),
+            "nuisance": {} if nn_cfg is None else dict(nn_cfg),
+            "encode": {} if encode_cfg is None else dict(encode_cfg),
+            **safeguards,
+        },
+        "estimator_contract": {
+            "observed_data_only": True,
+            "alignment_stop_gradient": True if factor_method in _LAMBDA_METHODS else None,
+            "coupled_loss_scales": "observed_representation_training_fold" if factor_method in _LAMBDA_METHODS else None,
+            "scores": "uncentered_crossfit_scores_in_original_subject_order",
+            "standard_error": "sqrt(sum((score-theta)^2)/(n*(n-1)))",
+        },
         "prediction_mse": float(prediction_mse),
         "prediction_rmse": float(prediction_rmse)
     }
@@ -1228,330 +1478,32 @@ def estimate_triply_IF(
         out["selected_lambda1"], out["selected_lambda2"], out["selected_lambda3"] = lam_A
         out["selected_lambda_A"] = lam_A
         out["selected_lambda_B"] = tuning["lambda_B"]
+    if return_effects:
+        # Add marginal-outcome fits only after the original theta10 path has
+        # finished; isolate their random state from caller and theta10 fitting.
+        score11, score00 = np.empty(n), np.empty(n)
+        base_outputs = [out_1, out_2, out_3, out_4]
+        for k, (roles, base) in enumerate(zip(fold_indices, base_outputs)):
+            features = fX_A if k < 2 else fX_B
+            with _isolated_random_state(seed + 3000 + k):
+                marginal = _fit_marginal_outcome_scores(
+                    features, A, Y, roles["nuisance_train"],
+                    roles["nuisance_validation"], roles["estimation"],
+                    base["propensity"], nn_cfg=nn_cfg)
+            score11[roles["estimation"]] = marginal["theta11"]
+            score00[roles["estimation"]] = marginal["theta00"]
+        out.update(summarize_effect_scores(score11, inference["crossfit_scores"], score00))
     return out
 # ============================================================
 # 10) Worker
 # ============================================================
 
-def _check_task_len(args, expected, fmt):
-    """
-    Guard the POSITIONAL task tuple against callers written before
-    `use_gxm_for_fm` was removed.
 
-    Without this, a stale tuple unpacks one element too long and raises a bare
-    "too many values to unpack" from inside a worker process, or -- worse, if a
-    driver is later edited to drop a different field -- unpacks successfully with
-    every argument after the removed slot shifted by one (dgp_cfg receiving the
-    old flag, mu receiving dgp_cfg). That silently produces a run on the wrong
-    DGP, which is the failure mode this whole exercise exists to avoid.
-    """
-    if len(args) > expected:
-        raise ValueError(
-            "Format %s task tuple has %d elements, expected %d. Fields have been "
-            "REMOVED from this contract: use_gxm_for_fm (the flag that followed "
-            "selection_rule -- f_M is always encoder_M(M) now) and, in Format A, "
-            "Fx_oracle / Fm_oracle (the oracle branch is gone). Drop them."
-            % (fmt, len(args), expected)
-        )
-    if len(args) != expected:
-        raise ValueError(
-            "Format %s task tuple has %d elements, expected %d."
-            % (fmt, len(args), expected)
-        )
-    return args
+def simulate_one_run(*args, **kwargs):
+    """The legacy worker mixed estimation and sample-based simulation truth."""
+    raise RuntimeError("Legacy simulation worker is disabled; use run_corrected_tables.py")
 
 
-def simulate_one_run(args):
-    """
-    Supports TWO task formats.
-
-    NOTE: both formats used to carry a `use_gxm_for_fm` flag immediately after
-    `selection_rule`. It is gone -- MediEncoder's f_M is always encoder_M(M).
-    The flag's True branch returned g_XM(A, encoder_X(X)) instead, which never
-    touches M and so threw away every part of the mediator not predictable from
-    (A, f_X). Because these tuples are POSITIONAL, a stale caller that still
-    passes the flag would silently shift dgp_cfg into it and mu into dgp_cfg, so
-    the length is asserted below rather than left to fail somewhere downstream.
-
-    ------------------------------------------------------------
-    Format A: sensitivity mode (data already generated outside)
-    ------------------------------------------------------------
-    (
-        X, M, A, Y, mu10_true_vals,
-        tilde_p, tilde_q,
-        seed,
-        factor_method,
-        split_cfg, nn_cfg, ae_cfg, factor_cfg, encode_cfg,
-        extra_obj,
-        selection_rule,          # must be "predictionError" (only rule left)
-        f_M_true_all
-    )
-
-    ------------------------------------------------------------
-    Format B: main Monte Carlo mode (generate data inside)
-    ------------------------------------------------------------
-    (
-        n, p, q,
-        bar_p, bar_q,
-        tilde_p, tilde_q,
-        seed,
-        factor_method,
-        split_cfg, nn_cfg, ae_cfg, factor_cfg, encode_cfg,
-        extra_obj,
-        selection_rule,          # must be "predictionError" (only rule left)
-        dgp_cfg,
-        mu,
-        sigma_eps_X,
-        sigma_eps_M,
-        sigma_y
-    )
-    """
-
-    import numpy as np
-    from DGP_and_estimate import generate_dgp
-
-    # ============================================================
-    # Detect task format
-    # ============================================================
-    if isinstance(args[0], np.ndarray):
-        # --------------------------------------------------------
-        # Format A: sensitivity mode
-        # --------------------------------------------------------
-        (
-            X, M, A, Y, mu10_true_vals,
-            tilde_p, tilde_q,
-            seed,
-            factor_method,
-            split_cfg, nn_cfg, ae_cfg, factor_cfg, encode_cfg,
-            extra_obj,
-            selection_rule,
-            f_M_true_all
-        ) = _check_task_len(args, 17, "A")
-
-        _check_selection_rule(selection_rule)
-
-    else:
-        # --------------------------------------------------------
-        # Format B: main Monte Carlo mode
-        # --------------------------------------------------------
-        (
-            n, p, q,
-            bar_p, bar_q,
-            tilde_p, tilde_q,
-            seed,
-            factor_method,
-            split_cfg, nn_cfg, ae_cfg, factor_cfg, encode_cfg,
-            extra_obj,
-            selection_rule,
-            dgp_cfg,
-            mu,
-            sigma_eps_X,
-            sigma_eps_M,
-            sigma_y
-        ) = _check_task_len(args, 21, "B")
-
-        _check_selection_rule(selection_rule)
-
-        set_all_seeds(seed)
-
-        data = generate_dgp(
-            n=n,
-            p=p,
-            q=q,
-            bar_p=bar_p,
-            bar_q=bar_q,
-            mu=mu,
-            sigma_eps_X=sigma_eps_X,
-            sigma_eps_M=sigma_eps_M,
-            sigma_y=sigma_y,
-            seed=seed,
-            **dgp_cfg
-        )
-
-        X = data["X"]
-        M = data["M"]
-        A = data["A"]
-        Y = data["Y"]
-        f_M_true_all = data["f_M"]
-        mu10_true_vals = data["mu10_true_vals"]
-
-    # ============================================================
-    # Standardize configs
-    # ============================================================
-    split_cfg = {} if split_cfg is None else dict(split_cfg)
-    nn_cfg = {} if nn_cfg is None else dict(nn_cfg)
-    ae_cfg = {} if ae_cfg is None else dict(ae_cfg)
-    factor_cfg = {} if factor_cfg is None else dict(factor_cfg)
-    encode_cfg = {} if encode_cfg is None else dict(encode_cfg)
-
-    factor_method = factor_method.lower()
-
-    # ============================================================
-    # Algorithm 1, the ONLY path. For the lambda-bearing methods extra_obj must
-    # be the tuning grid Lambda of step 4, selected per representation half from
-    # that half's own (I_tr, I_val) by Algorithm 2. There is no other mode.
-    #
-    # Two other modes existed and are deleted:
-    #
-    #   * "Mode A" -- taken whenever extra_obj was a lambda grid, i.e. for every
-    #     tuned MediEncoder run -- called tune_lambda_one_split, which returned
-    #     estimate_triply_IF_fixed_split: a SINGLE 0.4/0.2/0.4 split with
-    #     nuisances on the 0.4 train fold and theta on the 0.4 test fold. No
-    #     cross-fitting, 40% of the sample in the final average instead of 100%,
-    #     one train fold shared by every nuisance, and lambda selected on a split
-    #     overlapping the fold theta was computed from.
-    #
-    #   * "Mode B" -- fixed lambda. lambda is chosen from the data, so it is part
-    #     of the estimator; pinning it turns the method into an oracle.
-    # ============================================================
-    if isinstance(extra_obj, (list, tuple)) and len(extra_obj) > 0:
-        if factor_method not in _LAMBDA_METHODS:
-            raise ValueError(
-                "a lambda grid was supplied but factor_method=%r has no lambda; "
-                "pass extra_obj=None for it." % (factor_method,)
-            )
-        lambda_grid = list(extra_obj)
-        _check_lambda_grid_wellposed(lambda_grid)
-    else:
-        # Fixed lambda is not a mode. lambda is chosen from the data, so it is
-        # part of the estimator; pinning it (e.g. at the value most often
-        # selected in earlier tuned runs) is an oracle the method does not have,
-        # and it makes the reported estimator different from the one the
-        # algorithm defines. Algorithm 1 step 4 is not optional.
-        if factor_method in _LAMBDA_METHODS:
-            raise ValueError(
-                "factor_method=%r requires a lambda grid: pass the grid as "
-                "extra_obj. There is no fixed-lambda mode -- lambda must be "
-                "selected per fold by Algorithm 2." % (factor_method,)
-            )
-        lambda_grid = None
-
-    out = estimate_triply_IF(
-        X, M, A, Y,
-        tilde_p=tilde_p,
-        tilde_q=tilde_q,
-        factor_method=factor_method,
-        nn_cfg=nn_cfg,
-        ae_cfg=ae_cfg,
-        me_cfg=factor_cfg if factor_method in _ME_CFG_METHODS else None,
-        encode_cfg=encode_cfg,
-        seed=seed,
-        f_M_true_all=f_M_true_all,
-        mu10_true_vals=mu10_true_vals,
-        lambda_grid=lambda_grid
-    )
-
-    theta_true = float(out["theta_true"])
-
-    if lambda_grid is not None:
-        # No single "the" lambda under Algorithm 1: half A's is reported in the
-        # legacy columns, with both halves kept alongside.
-        sel1, sel2, sel3 = (out["selected_lambda1"], out["selected_lambda2"],
-                            out["selected_lambda3"])
-        cand_rows = out.get("fold_tuning", {}).get("candidate_rows_A")
-    else:
-        # a baseline with no lambda at all (projection / oracle / AE / VAE / IMAVAE)
-        sel1 = sel2 = sel3 = np.nan
-        cand_rows = None
-
-    return {
-            "factor_method": factor_method,
-            "mode": "predictionError",
-            "seed": int(seed),
-
-            "selected_lambda1": sel1,
-            "selected_lambda2": sel2,
-            "selected_lambda3": sel3,
-            "selected_lambda_A": out.get("selected_lambda_A"),
-            "selected_lambda_B": out.get("selected_lambda_B"),
-            "selected_beta_kl": out.get("selected_beta_kl", np.nan),
-            "fold_thetas": out.get("fold_thetas"),
-            "fold_est_sizes": out.get("fold_est_sizes"),
-
-            "theta_hat": float(out["theta_hat_IF"]),
-            "theta_true": theta_true,
-            "mu10_hat": np.nan,
-
-            "se_IF": out.get("se_IF", np.nan),
-            "ci_lower": out.get("ci_lower", np.nan),
-            "ci_upper": out.get("ci_upper", np.nan),
-        
-            "val_abs_error": np.nan,
-            "test_abs_error": float(abs(out["theta_hat_IF"] - theta_true)),
-        
-            "prediction_mse": float(out["prediction_mse"]),
-            "prediction_rmse": float(out["prediction_rmse"]),
-            "selection_metric_name": "prediction_mse",
-            "selection_metric_value": float(out["prediction_mse"]),
-        
-            "best_epoch": out["rep_fit_info"].get("best_epoch", np.nan) if out["rep_fit_info"] is not None else np.nan,
-            "best_weighted_loss": out["rep_fit_info"].get("best_weighted_loss", np.nan) if out["rep_fit_info"] is not None else np.nan,
-            "best_loss_X": out["rep_fit_info"].get("best_loss_X", np.nan) if out["rep_fit_info"] is not None else np.nan,
-            "best_loss_M": out["rep_fit_info"].get("best_loss_M", np.nan) if out["rep_fit_info"] is not None else np.nan,
-            "best_loss_align": out["rep_fit_info"].get("best_loss_align", np.nan) if out["rep_fit_info"] is not None else np.nan,
-        
-            "best_raw_loss_X": out["rep_fit_info"].get("best_raw_loss_X", np.nan) if out["rep_fit_info"] is not None else np.nan,
-            "best_raw_loss_M": out["rep_fit_info"].get("best_raw_loss_M", np.nan) if out["rep_fit_info"] is not None else np.nan,
-            "best_raw_loss_align": out["rep_fit_info"].get("best_raw_loss_align", np.nan) if out["rep_fit_info"] is not None else np.nan,
-        
-            "sd_X": out["rep_fit_info"].get("sd_X", np.nan) if out["rep_fit_info"] is not None else np.nan,
-            "sd_M": out["rep_fit_info"].get("sd_M", np.nan) if out["rep_fit_info"] is not None else np.nan,
-            "sd_fM": out["rep_fit_info"].get("sd_fM", np.nan) if out["rep_fit_info"] is not None else np.nan,
-        
-            "subtrain_n": np.nan,
-            "val_n": np.nan,
-            "test_n": X.shape[0],
-        
-            "candidate_rows": cand_rows
-        }
-
-
-# ============================================================
-# 11) Evaluation summary
-# ============================================================
-
-def evaluate_estimator_performance(theta_hats, theta_trues, *, alpha=0.05):
-    theta_hats = np.asarray(theta_hats, dtype=float)
-    theta_trues = np.asarray(theta_trues, dtype=float)
-
-    valid = np.isfinite(theta_hats) & np.isfinite(theta_trues)
-    theta_hats = theta_hats[valid]
-    theta_trues = theta_trues[valid]
-
-    if len(theta_hats) == 0:
-        return {
-            "Bias": np.nan,
-            "SD": np.nan,
-            "RMSE": np.nan,
-            "CI_low": np.nan,
-            "CI_high": np.nan,
-            "CI_Length": np.nan,
-            "Coverage": np.nan
-        }
-
-    diffs = theta_hats - theta_trues
-
-    bias = float(np.mean(diffs))
-    sd = float(np.std(diffs, ddof=1)) if len(diffs) > 1 else 0.0
-    rmse = float(np.sqrt(np.mean(diffs ** 2)))
-
-    z = float(norm.ppf(1 - alpha / 2))
-
-    ci_low = theta_hats - z * sd
-    ci_high = theta_hats + z * sd
-    ci_len = float(np.mean(ci_high - ci_low))
-
-    coverage = float(np.mean(
-        (theta_trues >= ci_low) &
-        (theta_trues <= ci_high)
-    ))
-
-    return {
-        "Bias": round(bias, 6),
-        "SD": round(sd, 6),
-        "RMSE": round(rmse, 6),
-        "CI_low": round(float(np.mean(ci_low)), 6),
-        "CI_high": round(float(np.mean(ci_high)), 6),
-        "CI_Length": round(ci_len, 6),
-        "Coverage": round(coverage, 6)
-    }
+def evaluate_estimator_performance(*args, **kwargs):
+    """The legacy Monte Carlo-SD interval summarizer is intentionally disabled."""
+    raise RuntimeError("Use replicate-specific intervals in run_corrected_tables.py")

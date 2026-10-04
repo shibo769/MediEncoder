@@ -3,10 +3,16 @@
 # Shared utilities for all models
 # ============================================================
 
+import os
 import torch
 import torch.nn as nn
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_requested_device = os.environ.get("MEDIENC_DEVICE", "auto")
+if _requested_device == "auto":
+    _requested_device = "cuda" if torch.cuda.is_available() else "cpu"
+if _requested_device.startswith("cuda") and not torch.cuda.is_available():
+    raise RuntimeError("A CUDA device was requested, but CUDA is not available.")
+device = torch.device(_requested_device)
 
 
 def build_mlp(
