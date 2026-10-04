@@ -75,6 +75,10 @@ For parallel execution on standard GitHub-hosted CPU runners, see the manual
 mechanism, computes the first 50 replications across 50 shards, and validates
 the saved scores before assembling either table.
 
+The separate [regularization experiment](docs/regularization.md) runs 100 paired
+replications of MediEncoder and its zero-alignment arm with shared weight decay
+0.01, importing the exact saved mechanism from the first 50-replication run.
+
 Defaults are six sample sizes (100, 300, 800, 1200, 2000, 3000), 200 replications,
 and five arms: Projection, Autoencoder, VAE, tuned MediEncoder, and MediEncoder
 with zero alignment weight. This is 6,000 fits, each potentially containing many

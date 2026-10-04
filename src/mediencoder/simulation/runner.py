@@ -115,11 +115,19 @@ def lambda_grids():
     return tune, zero
 
 
-def training_configuration(epochs):
+def validate_weight_decay(value):
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("weight decay must be finite and nonnegative")
+    return value
+
+
+def training_configuration(epochs, weight_decay=0.0):
     from mediencoder.estimation import SHARED_ADAM_EPS, SHARED_HIDDEN, SHARED_TRAIN_CFG, _shared_cfg
     # The existing implementation intentionally forbids per-method overrides.
     # Set the one shared cap before resolving ALL learners, including nuisance fits.
     SHARED_TRAIN_CFG["epochs"] = int(epochs)
+    SHARED_TRAIN_CFG["weight_decay"] = validate_weight_decay(weight_decay)
     return dict(
         nn_cfg=_shared_cfg(eps=SHARED_ADAM_EPS, hidden_dims=(300, 300, 300)),
         ae_cfg=_shared_cfg(eps=SHARED_ADAM_EPS, hidden_dims_X=SHARED_HIDDEN,
@@ -145,7 +153,7 @@ def make_config(args):
         mechanism_seed=args.mechanism_seed, seed_base=args.seed_base,
         n_values=args.n, B_requested=args.reps, methods=args.arms,
         dgp=asdict(DGPConfig()), tilde_p=10, tilde_q=10,
-        training=training_configuration(epochs),
+        training=training_configuration(epochs, getattr(args, "weight_decay", 0.0)),
         lambda_grid=tune, lambda_grid_zero=zero,
         stop_gradient=True, loss_normalization="observed representation-training fold only; validation reuses training scales",
         interval="theta_hat +/- 1.959963984540054 * sd(crossfit_scores, ddof=1)/sqrt(n)",
@@ -168,6 +176,20 @@ def runtime_training_configuration(training):
                         and (key == "betas" or key.startswith("hidden_dims")) else value
                    for key, value in settings.items()}
             for name, settings in training.items()}
+
+
+def configure_shared_training(training):
+    """Apply the recorded common budget in each spawned worker, including tuning."""
+    from mediencoder.estimation import SHARED_TRAIN_CFG
+    learners = ("nn_cfg", "ae_cfg", "me_cfg")
+    epoch_caps = {training[name]["epochs"] for name in learners}
+    if len(epoch_caps) != 1:
+        raise ValueError("All learners must use the same shared epoch cap")
+    weight_decays = {validate_weight_decay(training[name]["weight_decay"]) for name in learners}
+    if len(weight_decays) != 1:
+        raise ValueError("All learners must use the same shared weight decay")
+    SHARED_TRAIN_CFG["epochs"] = int(epoch_caps.pop())
+    SHARED_TRAIN_CFG["weight_decay"] = weight_decays.pop()
 
 
 def build_tasks(config):
@@ -216,6 +238,93 @@ def validate_manifest(existing, candidate):
         raise ValueError("Cannot resume: run fingerprint changed")
 
 
+def mechanism_prefix(path):
+    """Accept a saved bundle directory, prefix, or either artifact filename."""
+    path = Path(path).resolve()
+    if path.is_dir():
+        return path / "mechanism"
+    return path.with_suffix("") if path.suffix in (".json", ".npz") else path
+
+
+def validate_mechanism_config(mechanism, config):
+    from dataclasses import asdict
+    if canonical_json(asdict(mechanism.config)) != canonical_json(config["dgp"]):
+        raise ValueError("Imported/saved mechanism DGP configuration differs from this run")
+    if mechanism.parameter_seed != config["mechanism_seed"]:
+        raise ValueError("Imported/saved mechanism parameter seed differs from --mechanism-seed")
+
+
+def mechanism_artifact_hashes(prefix):
+    return {suffix: file_hash(Path(str(prefix) + "." + suffix)) for suffix in ("json", "npz")}
+
+
+def prepare_mechanism(output_dir, config, existing=None, mechanism_from=None):
+    """Import or draw once; never overwrite unmanifested scientific output.
+
+    Import locations are provenance, not scientific settings. The verified
+    mechanism content hash is included in the run identity by the caller.
+    Resume needs only the saved bundle; an explicitly supplied import is checked
+    again and cannot silently replace the run's original mechanism.
+    """
+    from mediencoder.simulation.dgp import draw_parameters, load_mechanism, save_mechanism
+    output_dir = Path(output_dir)
+    prefix = output_dir / "mechanism"
+    if existing is None:
+        # The monitor writes only these non-scientific files before launching
+        # the runner. Its two atomic-write temporaries can exist during startup.
+        monitor_files = {".runner.lock", "run.log", "supervisor.json", "progress.html",
+                         "supervisor.json.tmp", "progress.html.tmp"}
+        occupied = []
+        for path in output_dir.iterdir():
+            if path.name in monitor_files and not path.is_symlink():
+                if path.is_file() or not path.exists():
+                    continue  # An atomic-write temporary may already be renamed.
+            occupied.append(path.name)
+        if occupied:
+            raise ValueError("New runs require an empty output directory apart from monitor logs; refusing to overwrite existing files: "
+                             + ", ".join(sorted(occupied)))
+    imported = None
+    source_hashes = None
+    if mechanism_from is not None:
+        source_prefix = mechanism_prefix(mechanism_from)
+        imported = load_mechanism(source_prefix)
+        validate_mechanism_config(imported, config)
+        source_hashes = mechanism_artifact_hashes(source_prefix)
+    if existing is not None:
+        mechanism = load_mechanism(prefix)
+        validate_mechanism_config(mechanism, config)
+        if mechanism.mechanism_hash != existing["mechanism_hash"]:
+            raise ValueError("Cannot resume: saved mechanism differs from the original manifest")
+        if imported is not None and imported.mechanism_hash != mechanism.mechanism_hash:
+            raise ValueError("Cannot resume: --mechanism-from differs from the original imported mechanism")
+        provenance = existing.get("mechanism_provenance")
+        if provenance and mechanism_artifact_hashes(prefix) != provenance["saved_artifact_sha256"]:
+            raise ValueError("Cannot resume: saved mechanism artifacts changed since preparation")
+        return mechanism, provenance
+    mechanism = imported if imported is not None else draw_parameters(
+        config["dgp"], parameter_seed=config["mechanism_seed"])
+    validate_mechanism_config(mechanism, config)
+    if imported is not None and source_prefix.name == "mechanism":
+        # Preserve the canonical archived bundle byte for byte, including its
+        # NPZ compression and JSON line endings; never regenerate its parameters.
+        import shutil
+        for suffix in ("json", "npz"):
+            shutil.copyfile(Path(str(source_prefix) + "." + suffix),
+                            Path(str(prefix) + "." + suffix))
+        if (mechanism_artifact_hashes(prefix) != source_hashes
+                or load_mechanism(prefix).mechanism_hash != mechanism.mechanism_hash):
+            raise ValueError("Imported mechanism artifacts changed during preparation")
+    else:
+        # Custom prefix names need a canonical arrays_file field in the JSON.
+        save_mechanism(mechanism, prefix)
+    provenance = dict(kind="imported" if imported is not None else "generated",
+                      mechanism_hash=mechanism.mechanism_hash,
+                      saved_artifact_sha256=mechanism_artifact_hashes(prefix))
+    if source_hashes is not None:
+        provenance["source_artifact_sha256"] = source_hashes
+    return mechanism, provenance
+
+
 def validate_checkpoint(record, manifest, output_dir):
     if record.get("run_hash") != manifest["run_hash"]:
         raise ValueError(f"Checkpoint belongs to a different run: {record.get('task_id')}")
@@ -236,11 +345,7 @@ def _worker_init(config, output_dir, mechanism_prefix, run_hash):
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
-    from mediencoder.estimation import SHARED_TRAIN_CFG
-    epoch_caps = {config["training"][name]["epochs"] for name in ("nn_cfg", "ae_cfg", "me_cfg")}
-    if len(epoch_caps) != 1:
-        raise ValueError("All learners must use the same shared epoch cap")
-    SHARED_TRAIN_CFG["epochs"] = int(epoch_caps.pop())
+    configure_shared_training(config["training"])
     from mediencoder.simulation.dgp import load_mechanism
     _WORKER.update(config=config, output_dir=Path(output_dir),
                    mechanism=load_mechanism(mechanism_prefix), run_hash=run_hash,
@@ -469,11 +574,19 @@ def parse_args(argv=None):
     parser.add_argument("--max-tasks", type=int, default=None,
                         help="Run at most this many pending tasks for benchmarking; marks run as benchmark")
     parser.add_argument("--mechanism-seed", type=int, default=910000)
+    parser.add_argument("--mechanism-from", type=Path, default=None,
+                        help="Import the exact saved mechanism from a bundle directory, prefix, JSON or NPZ; DGP settings and parameter seed must match")
+    parser.add_argument("--weight-decay", type=float, default=0.0,
+                        help="Shared Adam weight decay for representation, nuisance and tuning fits; recorded in scientific run identity (default 0)")
     parser.add_argument("--seed-base", type=int, default=880000)
     parser.add_argument("--pilot-epochs", type=int, default=None)
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--summarize-only", action="store_true")
     args = parser.parse_args(argv)
+    try:
+        validate_weight_decay(args.weight_decay)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.tasks_per_worker < 1:
         parser.error("--tasks-per-worker must be positive")
     if args.target_reps is not None and not 1 <= args.target_reps <= args.reps:
@@ -508,15 +621,9 @@ def _main_locked(args):
                      or existing["code_hashes"] != code_hashes
                      or canonical_json(existing.get("environment")) != canonical_json(environment)):
         raise ValueError("Cannot resume: configuration, source files, or runtime environment changed. Use a new output directory.")
-    from mediencoder.simulation.dgp import draw_parameters, load_mechanism, save_mechanism
     prefix = output_dir / "mechanism"
-    if existing:
-        mechanism = load_mechanism(prefix)
-    else:
-        if any(output_dir.glob("tasks/*.json")):
-            raise ValueError("Existing checkpoints have no manifest; refusing to overwrite provenance")
-        mechanism = draw_parameters(config["dgp"], parameter_seed=config["mechanism_seed"])
-        save_mechanism(mechanism, prefix)
+    mechanism, mechanism_provenance = prepare_mechanism(
+        output_dir, config, existing=existing, mechanism_from=args.mechanism_from)
     manifest = dict(config=config, code_hashes=code_hashes, mechanism_hash=mechanism.mechanism_hash,
                     environment=environment)
     manifest["run_hash"] = digest(manifest)
@@ -525,6 +632,7 @@ def _main_locked(args):
         manifest = existing
     else:
         manifest.update(created_at=utc_now(), truth=mechanism.truth.to_dict(),
+                        mechanism_provenance=mechanism_provenance,
                         implementation_note="Paper/theory untouched. Fixed-mechanism population truth; observed-only train-fold scales; retained stop-gradient; dataset-specific IF intervals.")
         atomic_json(manifest_path, manifest)
     tasks = list(build_tasks(config))

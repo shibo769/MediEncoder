@@ -1,0 +1,79 @@
+{
+  "array_names": [
+    "Lambda_M_coef",
+    "Lambda_X_coef",
+    "Sigma_U",
+    "alpha",
+    "beta_0",
+    "beta_1",
+    "delta_0",
+    "delta_1",
+    "gamma_0",
+    "gamma_1",
+    "kappa_0",
+    "kappa_1",
+    "r_list",
+    "s_list"
+  ],
+  "arrays_file": "mechanism.npz",
+  "config": {
+    "L": 5,
+    "bar_p": 5,
+    "bar_q": 5,
+    "coef_scale_M": 1.0,
+    "coef_scale_X": 1.0,
+    "delta1_contrast": 2.0,
+    "delta1_shift": 0.0,
+    "delta1_spread": 1.0,
+    "mu": 0.0,
+    "p": 2000,
+    "pilot_size": 4096,
+    "q": 1000,
+    "r_max": 3,
+    "r_min": 1,
+    "sigma_U_scale": 0.05,
+    "sigma_eps_M": 1.0,
+    "sigma_eps_X": 2.0,
+    "sigma_y": 1.0
+  },
+  "mechanism_hash": "20e82d3e80e64bbcec053828a145ece1f93932ecd0b81376c937cbb37ebb2e69",
+  "metadata": {
+    "design_note": "Fixed independent pilot and parameter streams; not legacy bitwise reproduction.",
+    "generator": "numpy.PCG64",
+    "loading_seed": 4723103401444486480,
+    "numpy_version_at_creation": "2.5.3",
+    "pilot_seed": 6789670660109741123,
+    "pilot_size": 4096,
+    "structural_seed": 11866783661107095141,
+    "support_bounds": [
+      -3.254672288894761,
+      7.908107974217984
+    ],
+    "support_rule": "independent-fixed-latent-pilot-minmax"
+  },
+  "parameter_seed": 910000,
+  "schema_version": 1,
+  "truth": {
+    "atol": 1e-09,
+    "converged": true,
+    "orders": [
+      8,
+      12,
+      16
+    ],
+    "polynomial_term": 3.349433356513801,
+    "quadrature_values": [
+      0.8672872677809775,
+      0.8672872677809769,
+      0.8672872677809764
+    ],
+    "rtol": 1e-09,
+    "sine_term": -0.0,
+    "softplus_expectation": 0.8672872677809764,
+    "successive_differences": [
+      6.661338147750939e-16,
+      4.440892098500626e-16
+    ],
+    "value": 4.216720624294777
+  }
+}

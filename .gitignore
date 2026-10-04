@@ -15,6 +15,7 @@ data/
 *.RData
 *.RDS
 *.npz
+!experiments/mechanisms/wavelet_seed910000/mechanism.npz
 *.npy
 *.log
 *.tmp
