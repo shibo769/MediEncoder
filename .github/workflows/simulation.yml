@@ -1,0 +1,178 @@
+name: Synthetic main and ablation simulation
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_reps:
+        description: Replications per sample size and arm (a fresh CPU run)
+        type: choice
+        options: ['50']
+        default: '50'
+        required: true
+
+permissions:
+  contents: read
+
+# A second manual dispatch queues; it never cancels a running experiment.
+concurrency:
+  group: synthetic-main-ablation
+  cancel-in-progress: false
+
+env:
+  MEDIENC_DEVICE: cpu
+  OMP_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  OPENBLAS_NUM_THREADS: '1'
+  NUMEXPR_NUM_THREADS: '1'
+  PYTHONUNBUFFERED: '1'
+  PIP_NO_CACHE_DIR: '1'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-cpu
+      - name: Prepare the single fixed CPU mechanism and scientific manifest
+        env:
+          TARGET_REPS: ${{ inputs.target_reps }}
+        run: >-
+          python -m mediencoder.simulation.runner --output-dir prepared-run
+          --reps 200 --target-reps "$TARGET_REPS" --device cpu --workers 2
+          --summarize-only
+      - name: Build a bounded synthetic mechanism artifact
+        run: >-
+          python scripts/cloud_simulation.py package --source prepared-run
+          --destination prepared-artifact --kind prepared --byte-limit 2097152
+      - uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-prepared
+          path: prepared-artifact/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
+
+  canary:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-cpu
+      - uses: actions/download-artifact@v4
+        with:
+          name: synthetic-prepared
+          path: prepared-artifact
+      - name: Verify this runner matches the prepared runtime and source
+        env:
+          TARGET_REPS: ${{ inputs.target_reps }}
+        run: >-
+          python -m mediencoder.simulation.runner --output-dir prepared-artifact
+          --reps 200 --target-reps "$TARGET_REPS" --device cpu --workers 2
+          --summarize-only
+      - name: Measure one full-grid, full-epoch n100 MediEncoder fit
+        run: >-
+          timeout --signal=INT --kill-after=30s 25m
+          python -m mediencoder.simulation.runner --output-dir canary-run
+          --n 100 --arms mediencoder --reps 200 --target-reps 1 --max-tasks 1
+          --device cpu --workers 1
+      - name: Record the canary timing without treating it as formal results
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          rows = [json.loads(p.read_text()) for p in Path('canary-run/tasks').glob('*.json')]
+          text = '### Full-configuration CPU canary\n\n'
+          for r in rows:
+              text += f"n={r['n']}, {r['method']}: {r['status']}; {r['elapsed_seconds']:.1f} seconds.\n\n"
+          text += 'A single n100 fit is a resource check, not a completion-time guarantee or a formal replication.\n'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(text)
+          PY
+
+  shard:
+    needs: [prepare, canary]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-cpu
+      - uses: actions/download-artifact@v4
+        with:
+          name: synthetic-prepared
+          path: shard-run
+      - name: Run this balanced replication shard with two recycled CPU workers
+        env:
+          TARGET_REPS: ${{ inputs.target_reps }}
+          SHARD_INDEX: ${{ matrix.index }}
+        run: >-
+          timeout --signal=INT --kill-after=30s 300m
+          python -m mediencoder.simulation.runner --output-dir shard-run
+          --reps 200 --target-reps "$TARGET_REPS" --device cpu --workers 2
+          --tasks-per-worker 1 --shard-index "$SHARD_INDEX" --num-shards 50
+      - name: Preserve completed synthetic checkpoints after failure or timeout
+        if: always()
+        run: >-
+          python scripts/cloud_simulation.py package --source shard-run
+          --destination shard-artifact --kind shard --byte-limit 3145728
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: synthetic-shard-${{ matrix.index }}
+          path: shard-artifact/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
+
+  aggregate:
+    needs: [prepare, canary, shard]
+    if: ${{ always() && needs.prepare.result == 'success' && needs.canary.result == 'success' && !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-cpu
+      - uses: actions/download-artifact@v4
+        with:
+          name: synthetic-prepared
+          path: prepared-artifact
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: synthetic-shard-*
+          path: shard-artifacts
+          merge-multiple: false
+      - name: Validate every checkpoint and regenerate both tables
+        env:
+          TARGET_REPS: ${{ inputs.target_reps }}
+        run: >-
+          python scripts/cloud_simulation.py merge --prepared prepared-artifact
+          --shards shard-artifacts --output merged-run
+          --target-reps "$TARGET_REPS" --num-shards 50
+      - name: Publish the validation summary
+        if: always()
+        shell: bash
+        run: |
+          if test -f merged-run/merge_audit.md; then
+            cat merged-run/merge_audit.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Package verified merged outputs within the storage ceiling
+        if: always()
+        run: >-
+          python scripts/cloud_simulation.py package --source merged-run
+          --destination merged-artifact --kind merged --byte-limit 104857600
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: synthetic-main-ablation-validated
+          path: merged-artifact/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error

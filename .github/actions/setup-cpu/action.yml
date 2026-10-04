@@ -1,0 +1,16 @@
+name: Pinned synthetic CPU runtime
+description: Install a pinned CPU environment without persistent dependency caches.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12.13'
+    - name: Install the exact CPU dependencies
+      shell: bash
+      run: |
+        python -m pip install --disable-pip-version-check --no-cache-dir pip==25.2 wheel==0.45.1
+        python -m pip install --disable-pip-version-check --no-cache-dir --no-deps torch==2.8.0+cpu --index-url https://download.pytorch.org/whl/cpu
+        python -m pip install --disable-pip-version-check --no-cache-dir --no-deps -r requirements/cloud-cpu.txt
+        python -m pip install --disable-pip-version-check --no-cache-dir --no-deps --no-build-isolation -e .
+        python -m pip check

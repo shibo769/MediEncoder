@@ -70,6 +70,11 @@ the reserved 200; summaries and status show the current target (50, 100, or 200)
 Changing `--reps` itself changes the reserved scientific configuration and is
 rejected when resuming. Omit `--target-reps` to compute the full reservation.
 
+For parallel execution on standard GitHub-hosted CPU runners, see the manual
+[cloud simulation workflow](docs/cloud-simulation.md). It prepares one shared
+mechanism, computes the first 50 replications across 50 shards, and validates
+the saved scores before assembling either table.
+
 Defaults are six sample sizes (100, 300, 800, 1200, 2000, 3000), 200 replications,
 and five arms: Projection, Autoencoder, VAE, tuned MediEncoder, and MediEncoder
 with zero alignment weight. This is 6,000 fits, each potentially containing many

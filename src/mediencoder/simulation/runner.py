@@ -8,6 +8,9 @@ Examples (PowerShell):
 Re-running the same command resumes completed checkpoints. Scientific settings and
 source hashes must match; worker count may change. Pilot results are explicitly
 marked and must never be merged into formal results. No manuscript is edited.
+
+Distributed execution uses --shard-index K --num-shards N. Every shard must
+resume the same prepared manifest and mechanism; replication r belongs to r % N.
 """
 from __future__ import annotations
 
@@ -184,6 +187,15 @@ def execution_config(config, target_reps=None):
     if not isinstance(target, int) or not 1 <= target <= reserved:
         raise ValueError("target replications must be between 1 and the reserved --reps")
     return dict(config, B_requested=target, B_reserved=reserved)
+
+
+def select_shard_tasks(tasks, shard_index=0, num_shards=1):
+    """Partition replications without changing seeds or splitting paired arms."""
+    if (not isinstance(num_shards, int) or isinstance(num_shards, bool) or num_shards < 1
+            or not isinstance(shard_index, int) or isinstance(shard_index, bool)
+            or not 0 <= shard_index < num_shards):
+        raise ValueError("num_shards must be positive and shard_index must be in [0, num_shards)")
+    return [task for task in tasks if task["rep"] % num_shards == shard_index]
 
 
 def phase_records(records, config):
@@ -394,6 +406,12 @@ def write_reports(output_dir, records, config, started, phase, workers, active_t
     completed = sum(r["B_completed"] for r in rows)
     failed = sum(r["B_failed"] for r in rows)
     requested = sum(r["B_requested"] for r in rows)
+    shard_index, num_shards = config.get("shard_index", 0), config.get("num_shards", 1)
+    shard_reps = list(range(shard_index, config["B_requested"], num_shards))
+    shard_requested = len(shard_reps) * len(config["n_values"]) * len(config["methods"])
+    shard_records = select_shard_tasks(records.values(), shard_index, num_shards)
+    shard_completed = sum(row["status"] == "complete" for row in shard_records)
+    shard_failed = sum(row["status"] == "failed" for row in shard_records)
     active = []
     for task in active_tasks or []:
         progress_path = output_dir / "running" / (task["task_id"] + ".json")
@@ -406,6 +424,10 @@ def write_reports(output_dir, records, config, started, phase, workers, active_t
         pending=requested-completed-failed, workers=workers, run_kind=config["run_kind"],
         execution_target_reps=config["B_requested"], reserved_reps=config.get("B_reserved", config["B_requested"]),
         reserved_fits=config.get("B_reserved", config["B_requested"])*len(config["n_values"])*len(config["methods"]),
+        report_scope="shard_partial" if num_shards > 1 else "execution_phase",
+        shard_index=shard_index, num_shards=num_shards, shard_replication_indices=shard_reps,
+        shard_requested=shard_requested, shard_completed=shard_completed, shard_failed=shard_failed,
+        shard_pending=shard_requested-shard_completed-shard_failed,
         active_tasks=active,
         device=config["device"], coverage_denominator="completed valid replications only",
         failures=[{k:r.get(k) for k in ("task_id", "error_type", "error_message")}
@@ -438,6 +460,10 @@ def parse_args(argv=None):
     parser.add_argument("--reps", type=int, default=200)
     parser.add_argument("--target-reps", type=int, default=None,
                         help="Run/report only this replication prefix; later raise it up to reserved --reps without changing run identity")
+    parser.add_argument("--shard-index", type=int, default=0,
+                        help="Zero-based execution shard; requires the shared prepared manifest and mechanism")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Assign replication r to shard r %% num_shards; execution setting, not part of run identity")
     parser.add_argument("--arms", type=lambda s:s.split(","), default=list(METHODS),
                         help="Comma-separated arm names; default all five arms")
     parser.add_argument("--max-tasks", type=int, default=None,
@@ -452,6 +478,8 @@ def parse_args(argv=None):
         parser.error("--tasks-per-worker must be positive")
     if args.target_reps is not None and not 1 <= args.target_reps <= args.reps:
         parser.error("--target-reps must be between 1 and --reps")
+    if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
+        parser.error("--num-shards must be positive and --shard-index must be in [0, num-shards)")
     if args.workers < 1 or args.reps < 1 or min(args.n) < 40 or len(args.n) != len(set(args.n)):
         parser.error("workers/reps must be positive; unique sample sizes must be at least 40")
     if args.pilot_epochs is not None and not 1 <= args.pilot_epochs <= 300:
@@ -467,10 +495,13 @@ def _main_locked(args):
     configure_environment(args.device)
     config = make_config(args)
     report_config = execution_config(config, args.target_reps)
+    report_config.update(shard_index=args.shard_index, num_shards=args.num_shards)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "manifest.json"
     existing = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
+    if args.num_shards > 1 and existing is None:
+        raise ValueError("Distributed shards require a shared prepared manifest and mechanism. Prepare once with --summarize-only and no sharding, then copy that directory to each shard.")
     code_hashes = collect_code_hashes()
     environment = environment_identity(args.device)
     if existing and (canonical_json(existing["config"]) != canonical_json(config)
@@ -512,6 +543,7 @@ def _main_locked(args):
     pending = [t for t in tasks if t["task_id"] not in records
                or (args.retry_failed and records[t["task_id"]]["status"] == "failed")]
     pending = [task for task in pending if task["rep"] < report_config["B_requested"]]
+    pending = select_shard_tasks(pending, args.shard_index, args.num_shards)
     if args.retry_failed:
         # A retry keeps the original seed and preserves every failed attempt.
         # Never turn discarded failures into invisible successful replications.
@@ -525,14 +557,20 @@ def _main_locked(args):
     atomic_json(output_dir / "execution_plan.json", dict(
         run_hash=manifest["run_hash"], reserved_reps=config["B_requested"],
         execution_target_reps=report_config["B_requested"], requested_at=started,
-        replication_indices=[0, report_config["B_requested"]-1]))
+        replication_indices=[0, report_config["B_requested"]-1],
+        shard_index=args.shard_index, num_shards=args.num_shards,
+        shard_replication_indices=list(range(args.shard_index, report_config["B_requested"], args.num_shards)),
+        shard_pending_tasks=len(pending)))
     counts = write_reports(output_dir, records, report_config, started, "summarized" if args.summarize_only else "running", args.workers)
     print(f"{config['run_kind']} {manifest['run_hash'][:12]}: complete={counts[0]} failed={counts[1]} requested={counts[2]} to_run={len(pending)}", flush=True)
     print(f"Population truth={mechanism.truth.value:.12g}; output={output_dir}", flush=True)
+    if args.num_shards > 1:
+        print(f"Execution shard {args.shard_index}/{args.num_shards}: replication r % {args.num_shards} = {args.shard_index}. Reports retain the full {report_config['B_requested']}-replication target; shard outputs are partial.", flush=True)
     if args.summarize_only:
         return 0
     iterator = iter(pending)
-    phase = "benchmark_batch_finished" if args.max_tasks is not None else "finished"
+    phase = ("benchmark_batch_finished" if args.max_tasks is not None else
+             "shard_finished" if args.num_shards > 1 else "finished")
     try:
         with ProcessPoolExecutor(max_workers=args.workers, mp_context=mp.get_context("spawn"),
                                  max_tasks_per_child=args.tasks_per_worker,
