@@ -468,9 +468,8 @@ def _fit_outcome_predictor_and_eval(
 # epochs were 200 for some branches and 150 for others. A shared source makes
 # such a divergence impossible to reintroduce by editing one branch.
 #
-# weight_decay is 0.0 for ALL methods, on the author's instruction: the paper's
-# Sec 5.1 text ("weight decay 1e-3") is wrong, and 0.0 is the intended setting.
-# The paper text needs correcting, not this block.
+# The current manuscript and code use weight_decay=0.0 for all methods,
+# including representation, auxiliary, and final nuisance networks.
 #
 # The LR schedule and epoch cap DO follow Sec 5.1 -- step(30, 0.5) and at most 300
 # epochs -- because those were plain drift, not a disputed value. On the paper's
@@ -554,11 +553,10 @@ def _merge_method_cfg(cfg, defaults, *, method):
     optimisers as much as estimators. Forcing them here fixes every driver at once
     instead of relying on ~50 config blocks staying in step.
 
-    Note that epochs=300 / scheduler_type="step" / patience=30, which the older
-    drivers carry, are the PAPER'S values (Sec 5.1) and are now the shared values
-    too -- they were drift, not staleness. weight_decay is the exception: the
-    drivers and the paper both say 1e-3, but the author's instruction is 0.0, so
-    the shared block forces 0.0 over any driver that asks for 1e-3.
+    The shared defaults use epochs=300, scheduler_type="step", patience=25,
+    and weight_decay=0.0. They override stale per-driver values unless the
+    explicit opt-out below is used. A prespecified shared override is recorded
+    in the simulation manifest and is not the default experiment.
 
     Everything that genuinely defines a method -- its loss weights (lambda1,
     lambda2, lambda3, beta_kl, alpha, beta), the topology of its auxiliary heads,

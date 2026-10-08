@@ -1,4 +1,4 @@
-name: Paired MediEncoder regularization at weight decay 0.01
+name: Paired MediEncoder on retained mechanism (weight decay 0)
 
 on:
   workflow_dispatch:
@@ -10,10 +10,10 @@ on:
         default: '100'
         required: true
       weight_decay:
-        description: Prespecified L2 weight decay for all shared neural learners
+        description: Zero weight decay for all shared neural learners
         type: choice
-        options: ['0.01']
-        default: '0.01'
+        options: ['0.0']
+        default: '0.0'
         required: true
 
 permissions:
@@ -111,7 +111,7 @@ jobs:
           import json, os
           from pathlib import Path
           rows = [json.loads(p.read_text()) for p in Path('canary-run/tasks').glob('*.json')]
-          text = '### Prespecified regularization CPU canary\n\n'
+          text = '### Zero-weight-decay CPU canary\n\n'
           for r in rows:
               text += f"n={r['n']}, {r['method']}: {r['status']}; {r['elapsed_seconds']:.1f} seconds.\n\n"
               text += f"Observed data SHA256: `{r.get('observed_data_sha256', 'unavailable')}`\n\n"

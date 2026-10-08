@@ -1,4 +1,7 @@
-"""Read-only comparison of validated WD=0/B50 and WD=.01/B100 artifacts.
+"""Read-only audit of historical WD=0/B50 and WD=.01/B100 artifacts.
+
+The nonzero value here validates archived scientific identities; it is not a
+training default. Current code and workflow defaults use weight decay zero.
 
 No model or scientific package is imported. Exit 0 means all planned records
 and comparisons are complete; 2 means missing/failed fits; 1 means invalid input.

@@ -1,10 +1,12 @@
-# Prespecified MediEncoder regularization experiment
+# Paired MediEncoder with a retained mechanism
 
-The manual **Paired MediEncoder regularization at weight decay 0.01** workflow
-(`.github/workflows/regularization.yml`) evaluates a single prespecified weight
-decay, `0.01`. It fits MediEncoder and its zero-alignment ablation on the same
-datasets and partitions. It does not search over regularization strengths or
-rerun Projection, Autoencoder, or VAE.
+The manual **Paired MediEncoder on retained mechanism (weight decay 0)**
+workflow (`.github/workflows/regularization.yml`) uses weight decay `0.0` for
+every neural learner, matching the current training defaults. It fits
+MediEncoder and its zero-alignment ablation on the same datasets and partitions.
+It does not search over regularization strengths or rerun Projection,
+Autoencoder, or VAE. This optional workflow explicitly retains the historical
+Haar mechanism. The main simulation runner defaults to cubic polynomial loadings.
 
 ## Fixed experimental design
 
@@ -24,28 +26,25 @@ dependency on the previous run's expiring GitHub artifact.
 | Replications in this execution phase | 100 per sample size and arm |
 | Reserved replications | 200, allowing a later extension using unchanged configuration |
 | Fitted arms | `mediencoder`, `mediencoder_l3zero` |
-| Weight decay | 0.01 for all shared neural learners |
+| Weight decay | 0 for all shared neural learners |
 | Maximum epochs | 300, with the existing early stopping and scheduler |
 | Tuning grids | 36 positive-alignment candidates; 9 zero-alignment candidates |
 | Population target | `E[Y(1,M(0))] = 4.216720624294777` for this fixed mechanism |
 
-Weight decay applies to the representation networks, auxiliary outcome regressions
-used for tuning, and nuisance regressions. It is not restricted to the encoders.
-In that historical run, stop-gradient alignment, observable training-fold loss scales, reconstruction
-checkpointing, network widths, learning rate, batch size, and propensity safeguards
-retained their existing settings. Each dataset's confidence interval uses its own
-cross-fitted scores. The manifest records the effective training settings and
-scientific source hashes; this experiment has a new run identity and output
-directory. Subsequent code changes on October 6 removed coupled-loss variance
-normalization and adopted within-fold score variance. The current code therefore
-defines a new experiment and cannot resume or reproduce this historical
-weight-decay-only run without its frozen source snapshot.
+Zero weight decay applies to the representation networks, auxiliary outcome
+regressions used for tuning, and final nuisance regressions. Current coupled
+losses use raw MSE with simplex-constrained lambda weights and stop-gradient
+alignment. Each dataset's confidence interval uses its own cross-fitted scores
+and within-fold score variance. The manifest records effective training settings
+and scientific source hashes. A run using the current source requires a new
+run identity and output directory; it cannot resume historical checkpoints
+created from different source or settings.
 
 The retained mechanism has a known limitation: only one of its five shared Haar
 atoms has nonzero support on the covariate factors' interval `[-1,1]`. Its
 covariate measurement mean depends on binary indicators of those factors, rather
 than their within-interval values. This experiment deliberately retains that
-mechanism for a controlled regularization comparison. Increasing weight decay
+mechanism for paired comparisons on the same saved data. Changing weight decay
 does not repair the information lost by the measurement map, and results should
 not be described as establishing factor recovery or general performance across
 different mechanisms.
@@ -57,9 +56,7 @@ size, and replication index. They do not depend on which methods are requested,
 the weight decay, worker assignment, or completion order. Within this run, the
 two arms share observed data and cross-fitting partitions for every `(n, rep)`.
 
-Replications 0–49 also retain the prior run's data and training seeds. A paired
-comparison of weight decay 0 versus 0.01 should use those matching replications
-and verify their saved `observed_data_sha256` values. Before preparing the new
+Replications 0–49 also retain the prior run's data and training seeds. Before preparing the new
 manifest, the cloud workflow regenerates all 300 previous datasets (50
 replications at six sample sizes) from the retained mechanism and checks their
 seeds and bitwise observed-data hashes against `reference_data_hashes.json`.
@@ -67,14 +64,24 @@ This check performs no neural-network fitting. A mismatch stops the workflow
 before the canary or formal fits; matching seeds alone do not establish bitwise
 pairing across platforms. Replications 50–99 have no
 matching fit in the prior 50-replication run. Comparing an old 50-replication
-summary directly against a new 100-replication summary does not isolate weight
-decay from Monte Carlo variation. The zero-alignment arm is refitted under 0.01
-so the within-run alignment comparison uses the same regularization setting.
+summary directly against a new 100-replication summary does not isolate code or
+setting changes from Monte Carlo variation. Both current arms use weight decay
+0, so the within-run alignment comparison uses the same regularization setting.
+
+## Historical regularization comparison
+
+Earlier experiments compared shared weight decay 0 against 0.01. Their saved
+manifests, results, and frozen source snapshots retain those original values.
+`scripts/compare_regularization.py` audits exactly that historical comparison;
+its check for 0.01 is not a current training setting. The historical runs used
+the loss scaling and inference code in their respective source snapshots.
+Current code has changed beyond weight decay and cannot be presented as a
+weight-decay-only reproduction of those runs.
 
 ## Execution and artifacts
 
 Dispatch `regularization.yml` manually with `target_reps=100` and
-`weight_decay=0.01`. The workflow first verifies the previous datasets on the
+`weight_decay=0.0`. The workflow first verifies the previous datasets on the
 current cloud runtime, then builds a fresh scientific manifest from the retained
 mechanism. A full-grid, full-epoch n=100 MediEncoder canary uses the
 same mechanism and regularization; it must succeed before the matrix starts.
