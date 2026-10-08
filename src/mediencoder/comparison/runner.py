@@ -85,7 +85,11 @@ def run_replicate(mechanism, n, replicate, data_seed, methods, options=None, ext
                         raise ValueError(f"Invalid {effect} score coverage; require exactly n finite scores")
                 Path(score_dir).mkdir(parents=True, exist_ok=True)
                 score_path = Path(score_dir) / f"n{n}-rep{replicate}-{method}.npz"
-                np.savez_compressed(score_path, **scores)
+                arrays = {**scores, "subject_index": np.arange(n)}
+                for k, fold in enumerate(result.pop("fold_indices", [])):
+                    for role, indices in fold.items():
+                        arrays[f"fold{k}_{role}"] = np.asarray(indices, dtype=np.int64)
+                np.savez_compressed(score_path, **arrays)
                 result["score_file"] = str(score_path.name)
             else:
                 result.pop("effect_scores", None)

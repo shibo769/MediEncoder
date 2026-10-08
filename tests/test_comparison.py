@@ -169,3 +169,25 @@ def test_declared_canonical_budget_is_applied_and_restored_even_on_failure():
             raise RuntimeError("test")
     assert estimation.SHARED_TRAIN_CFG == before
     assert estimation.SHARED_HIDDEN == hidden
+
+
+def test_core_comparison_saves_evaluation_folds_for_independent_se_check(monkeypatch, tmp_path):
+    from mediencoder import estimation
+    n = 20
+    s11 = np.arange(n, dtype=float) ** 2
+    s10, s00 = np.arange(n, dtype=float), np.zeros(n)
+    split = np.array_split(np.arange(n), 4)
+    raw = estimation.summarize_effect_scores(s11, s10, s00, estimation_indices=split)
+    raw["fold_indices"] = [{"estimation": indices} for indices in split]
+    monkeypatch.setattr(estimation, "estimate_triply_IF", lambda *args, **kwargs: raw)
+    params = draw_mechanism(ComparisonConfig(p=4, q=3, bar_p=2, bar_q=2), 9)
+    row, = run_replicate(params, n, 0, 99, ["projection"], score_dir=tmp_path)
+    assert row["status"] == "ok"
+    assert row["effect_variance_estimator"] == "within_fold_size_weighted"
+    with np.load(tmp_path / row["score_file"]) as saved:
+        np.testing.assert_array_equal(saved["subject_index"], np.arange(n))
+        for effect in ("NIE", "NDE", "TE"):
+            variance = sum(len(saved[f"fold{k}_estimation"]) *
+                           np.var(saved[effect][saved[f"fold{k}_estimation"]], ddof=1)
+                           for k in range(4)) / n**2
+            assert row["effect_se"][effect] ** 2 == pytest.approx(variance)

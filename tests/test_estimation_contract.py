@@ -17,7 +17,7 @@ class EstimationContractTests(unittest.TestCase):
             estimator.estimate_triply_IF,
             estimator._select_lambda_for_fold,
             estimator._learn_representations_fixed_split,
-            trainer.compute_loss_scales,
+            trainer._validate_coupled_inputs,
             trainer.train_mediencoder,
             trainer.train_mediencoder_vae,
         ):
@@ -27,17 +27,15 @@ class EstimationContractTests(unittest.TestCase):
             }, function.__name__)
             self.assertFalse(any(p.kind == p.VAR_KEYWORD for p in names.values()))
 
-    def test_observable_scales_are_training_mediator_variance(self):
+    def test_observed_input_validation_requires_no_scales_or_latent_values(self):
         X = np.arange(20, dtype=float).reshape(5, 4)
         M = np.arange(15, dtype=float).reshape(5, 3) / 2
-        scales = trainer.compute_loss_scales(X, M)
-        self.assertAlmostEqual(scales["var_X"], np.var(X))
-        self.assertAlmostEqual(scales["var_M"], np.var(M))
-        self.assertEqual(scales["var_align"], scales["var_M"])
+        self.assertIsNone(trainer._validate_coupled_inputs(X, M))
+        self.assertIsNone(trainer._validate_coupled_inputs(np.ones_like(X), np.ones_like(M)))
         with self.assertRaises(TypeError):
-            trainer.compute_loss_scales(X, M, f_M_train=M * 1e9)
+            trainer._validate_coupled_inputs(X, M, f_M_train=M * 1e9)
         with self.assertRaises(ValueError):
-            trainer.compute_loss_scales(X, np.full_like(M, np.nan))
+            trainer._validate_coupled_inputs(X, np.full_like(M, np.nan))
 
     @staticmethod
     def _score_fixture():
@@ -48,16 +46,19 @@ class EstimationContractTests(unittest.TestCase):
                    for i in indices]
         return scores, indices, outputs
 
-    def test_population_score_se_and_unequal_fold_weighting(self):
+    def test_within_fold_score_se_and_unequal_fold_weighting(self):
         scores, indices, outputs = self._score_fixture()
         result = estimator._aggregate_crossfit_scores(len(scores), indices, outputs)
-        expected_se = np.std(scores, ddof=1) / np.sqrt(len(scores))
+        expected_se = np.sqrt(sum(len(i) * np.var(scores[i], ddof=1) for i in indices)) / len(scores)
         np.testing.assert_array_equal(result["crossfit_scores"], scores)
         self.assertAlmostEqual(result["theta_hat_IF"], scores.mean())
         self.assertAlmostEqual(result["se_IF"], expected_se)
         self.assertAlmostEqual(result["ci_upper"] - result["ci_lower"],
                                2 * 1.959963984540054 * expected_se)
         self.assertEqual(result["n_scores"], len(scores))
+        self.assertEqual(result["variance_estimator"], "within_fold_size_weighted")
+        np.testing.assert_allclose(result["fold_score_variances"],
+                                   [np.var(scores[i], ddof=1) for i in indices])
         self.assertNotAlmostEqual(scores.mean(), np.mean([o["theta_hat_IF"] for o in outputs]))
 
     def test_bad_scores_and_bad_coverage_fail_instead_of_dropping_subjects(self):
@@ -142,7 +143,7 @@ class EstimationContractTests(unittest.TestCase):
         self.assertEqual(len(caught.exception.tuning_rows), 2)
         self.assertIn("all fail", str(caught.exception))
 
-    def test_one_epoch_uses_observed_scales_and_fixed_reconstruction_monitor(self):
+    def test_one_epoch_uses_raw_losses_and_fixed_reconstruction_monitor(self):
         rng = np.random.default_rng(18)
         X, M = rng.normal(size=(8, 4)), rng.normal(size=(8, 3))
         Xv, Mv = 5 * rng.normal(size=(6, 4)), 9 * rng.normal(size=(6, 3))
@@ -155,15 +156,17 @@ class EstimationContractTests(unittest.TestCase):
                 hidden_dims_X=(4,), hidden_dims_M=(4,), hidden_dims_XM=(4,),
                 activation="tanh", scheduler_type="none", verbose=False)
         self.assertGreater(alignment.call_count, 0)
-        self.assertAlmostEqual(info["var_align"], np.var(M))
+        self.assertEqual(info["loss_normalization"], "none")
+        for key in ("loss_X", "loss_M", "loss_align", "weighted_loss"):
+            np.testing.assert_allclose(history[key], history["raw_" + key])
         self.assertEqual(info["checkpoint_criterion"], "reconstruction")
         device = next(model.parameters()).device
         with torch.no_grad():
             out = model(torch.tensor(Xv, dtype=torch.float32, device=device),
                         torch.tensor(Mv, dtype=torch.float32, device=device),
                         torch.tensor(Av, dtype=torch.float32, device=device))
-            expected = .2 * torch.mean((out["X_recon"] - torch.tensor(Xv, dtype=torch.float32, device=device)) ** 2).item() / np.var(X)
-            expected += .5 * torch.mean((out["M_recon"] - torch.tensor(Mv, dtype=torch.float32, device=device)) ** 2).item() / np.var(M)
+            expected = .2 * torch.mean((out["X_recon"] - torch.tensor(Xv, dtype=torch.float32, device=device)) ** 2).item()
+            expected += .5 * torch.mean((out["M_recon"] - torch.tensor(Mv, dtype=torch.float32, device=device)) ** 2).item()
         self.assertAlmostEqual(info["best_weighted_loss"], expected, places=5)
 
     def test_unsafe_legacy_evaluation_is_disabled(self):

@@ -34,7 +34,8 @@ from mediencoder.training import (
     train_mediencoder,
     encode_with_mediencoder,
     train_mediencoder_vae,
-    encode_with_mediencoder_vae
+    encode_with_mediencoder_vae,
+    validate_lambdas_unbalanced,
 )
 
 import random
@@ -666,8 +667,45 @@ def _fit_marginal_outcome_scores(f_X, A, Y, train_idx, val_idx, target_idx, prop
     return scores
 
 
-def summarize_effect_scores(theta11, theta10, theta00):
-    """Compute matched-subject contrasts and their covariance of sample means."""
+def _foldwise_score_covariance(scores, estimation_indices):
+    """Estimate covariance of the size-weighted cross-fitted score mean.
+
+    Center within each evaluation fold: sum_k n_k * S_k / n**2, where
+    S_k is the sample covariance with denominator n_k - 1. This is an
+    asymptotic cross-fitting variance estimator, not a claim that the fitted
+    fold estimates are independent in finite samples.
+    """
+    scores = np.asarray(scores, dtype=float)
+    if scores.ndim != 2 or len(scores) < 2 or scores.shape[1] < 1 or not np.isfinite(scores).all():
+        raise ValueError("Scores must be a finite subject-by-component matrix")
+    n, dimension = scores.shape
+    seen = np.zeros(n, dtype=int)
+    covariance = np.zeros((dimension, dimension), dtype=float)
+    fold_covariances = []
+    for indices in estimation_indices:
+        indices = np.asarray(indices)
+        if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+            raise ValueError("Estimation indices must be one-dimensional integers")
+        if len(indices) < 2 or np.any(indices < 0) or np.any(indices >= n):
+            raise ValueError("Each estimation fold needs at least two in-range subjects")
+        np.add.at(seen, indices, 1)
+        centered = scores[indices] - scores[indices].mean(axis=0)
+        fold_covariance = centered.T @ centered / (len(indices) - 1)
+        covariance += (len(indices) / n**2) * fold_covariance
+        fold_covariances.append(fold_covariance)
+    if not np.all(seen == 1):
+        raise ValueError("Estimation folds must cover each subject exactly once")
+    if not np.isfinite(covariance).all():
+        raise ValueError("Nonfinite within-fold score covariance")
+    return covariance, fold_covariances
+
+
+def summarize_effect_scores(theta11, theta10, theta00, *, estimation_indices=None):
+    """Use matched-subject contrasts and within-fold covariance of their mean.
+
+    Cross-fitted callers must supply the evaluation folds. Without folds,
+    treat the input as one sample; this preserves the standalone score API.
+    """
     arrays = [np.asarray(v, dtype=float) for v in (theta11, theta10, theta00)]
     if any(v.ndim != 1 for v in arrays) or len(arrays[0]) < 2 or any(v.shape != arrays[0].shape for v in arrays):
         raise ValueError("Component scores must be matching vectors with at least two subjects")
@@ -676,7 +714,9 @@ def summarize_effect_scores(theta11, theta10, theta00):
     s11, s10, s00 = arrays
     order = ["NIE", "NDE", "TE"]
     matrix = np.column_stack((s11-s10, s10-s00, s11-s00))
-    covariance = np.cov(matrix, rowvar=False, ddof=1) / len(s11)
+    if estimation_indices is None:
+        estimation_indices = [np.arange(len(s11))]
+    covariance, fold_covariances = _foldwise_score_covariance(matrix, estimation_indices)
     means, errors = matrix.mean(axis=0), np.sqrt(np.diag(covariance))
     if not np.all(np.isfinite(covariance)):
         raise ValueError("Nonfinite effect covariance")
@@ -687,6 +727,8 @@ def summarize_effect_scores(theta11, theta10, theta00):
         "effect_ci": {key: [float(means[j]-z*errors[j]), float(means[j]+z*errors[j])] for j, key in enumerate(order)},
         "effect_scores": {key: matrix[:, j].copy() for j, key in enumerate(order)},
         "effect_covariance": covariance, "effect_order": order,
+        "effect_fold_score_covariances": fold_covariances,
+        "effect_variance_estimator": "within_fold_size_weighted",
         "component_scores": dict(zip(["theta11", "theta10", "theta00"], arrays)),
         "component_means": dict(zip(["theta11", "theta10", "theta00"], [float(v.mean()) for v in arrays])),
     }
@@ -1052,20 +1094,26 @@ def _check_lambda_grid_wellposed(lambda_grid):
     in the reported table. lambda3 = 0 is well posed and allowed (it is the
     ablation arm).
     """
-    if len(lambda_grid) == 0:
+    try:
+        size = len(lambda_grid)
+    except TypeError as exc:
+        raise ValueError("lambda_grid must be a nonempty sequence of three-number candidates") from exc
+    if size == 0:
         raise ValueError("lambda_grid is empty.")
-    bad = [
-        tuple(float(v) for v in t) for t in lambda_grid
-        if float(t[0]) <= 1e-6 or float(t[1]) <= 1e-6
-    ]
-    if len(bad) > 0:
-        raise ValueError(
-            "lambda_grid contains ill-posed candidates with lambda1 = 0 or "
-            f"lambda2 = 0: {bad}. Build the grid with "
-            "generate_lambda_grid(..., require_positive_recon=True) (the "
-            "default) or generate_ablation_lambda_grid(), both of which drop "
-            "these corners."
-        )
+    for index, candidate in enumerate(lambda_grid):
+        try:
+            values = np.asarray(candidate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"lambda_grid candidate {index} must contain exactly three finite numbers") from exc
+        if values.shape != (3,):
+            raise ValueError(f"lambda_grid candidate {index} must contain exactly three finite numbers")
+        if not validate_lambdas_unbalanced(*values, C=1.0, tol=1e-6):
+            raise ValueError(
+                f"Invalid lambda_grid candidate {index}: {candidate!r}. "
+                "Need three finite nonnegative numbers, lambda1 > 1e-6, "
+                "lambda2 > 1e-6, and lambda1 + lambda2 + lambda3 = 1 "
+                "(absolute tolerance 1e-6). Candidates are not automatically normalized."
+            )
 
 
 def _select_lambda_for_fold(
@@ -1187,11 +1235,14 @@ def _aggregate_crossfit_scores(n, estimation_indices, fold_outputs):
     theta = float(scores.mean())
     if not np.isclose(theta, weighted_theta, rtol=1e-12, atol=1e-12):
         raise ValueError("Pooled score mean differs from size-weighted estimate")
-    se = float(np.sqrt(np.sum((scores - theta) ** 2) / (n * (n - 1))))
+    covariance, fold_covariances = _foldwise_score_covariance(scores[:, None], estimation_indices)
+    se = float(np.sqrt(covariance[0, 0]))
     if not np.isfinite(se):
         raise ValueError("Nonfinite cross-fit standard error")
     z = 1.959963984540054
     return dict(theta_hat_IF=theta, crossfit_scores=scores, n_scores=n,
+                variance_estimator="within_fold_size_weighted",
+                fold_score_variances=[float(value[0, 0]) for value in fold_covariances],
                 se_IF=se, ci_lower=float(theta-z*se), ci_upper=float(theta+z*se))
 
 
@@ -1242,8 +1293,8 @@ def estimate_triply_IF(
         raise ValueError("preprocessing must be 'none' or 'standardize'")
     safeguards = _resolve_numerical_safeguards(numerical_safeguards)
     n = X.shape[0]
-    if n < 4 or any(len(v) != n for v in (M, A, Y)):
-        raise ValueError("Observed arrays must have the same length, at least four")
+    if n < 8 or any(len(v) != n for v in (M, A, Y)):
+        raise ValueError("Observed arrays must have the same length, at least eight for within-fold variance")
     if not all(np.all(np.isfinite(v)) for v in (X, M, A, Y)):
         raise ValueError("Observed inputs must all be finite")
     if not np.all(np.isin(A, [0, 1])):
@@ -1457,9 +1508,10 @@ def estimate_triply_IF(
         "estimator_contract": {
             "observed_data_only": True,
             "alignment_stop_gradient": True if factor_method in _LAMBDA_METHODS else None,
-            "coupled_loss_scales": "observed_representation_training_fold" if factor_method in _LAMBDA_METHODS else None,
+            "coupled_loss_scales": "none" if factor_method in _LAMBDA_METHODS else None,
+            "coupled_loss_reduction": "mean_over_subjects_and_coordinates" if factor_method in _LAMBDA_METHODS else None,
             "scores": "uncentered_crossfit_scores_in_original_subject_order",
-            "standard_error": "sqrt(sum((score-theta)^2)/(n*(n-1)))",
+            "standard_error": "sqrt(sum_k(n_k * var(scores_in_fold_k, ddof=1))/n^2)",
         },
         "prediction_mse": float(prediction_mse),
         "prediction_rmse": float(prediction_rmse)
@@ -1492,7 +1544,9 @@ def estimate_triply_IF(
                     base["propensity"], nn_cfg=nn_cfg)
             score11[roles["estimation"]] = marginal["theta11"]
             score00[roles["estimation"]] = marginal["theta00"]
-        out.update(summarize_effect_scores(score11, inference["crossfit_scores"], score00))
+        out.update(summarize_effect_scores(
+            score11, inference["crossfit_scores"], score00,
+            estimation_indices=[roles["estimation"] for roles in fold_indices]))
     return out
 # ============================================================
 # 10) Worker

@@ -104,7 +104,11 @@ def validate_scores(record, directory, truth):
             est.append(indices[-1])
         if not np.array_equal(np.sort(np.concatenate(est)), np.arange(n)):
             raise ValueError("Estimation folds must cover every observation exactly once")
-        mean, se = float(scores.mean()), float(scores.std(ddof=1)/np.sqrt(n))
+        if any(len(indices) < 2 for indices in est):
+            raise ValueError("Each estimation fold needs at least two subjects for variance")
+        mean = float(scores.mean())
+        se = float(np.sqrt(sum(len(indices) * np.var(scores[indices], ddof=1)
+                               for indices in est) / n**2))
     expected = dict(theta_hat=mean, theta_population=truth, error=mean-truth, se_IF=se,
                     ci_lower=mean-1.959963984540054*se, ci_upper=mean+1.959963984540054*se,
                     ci_length=2*1.959963984540054*se)

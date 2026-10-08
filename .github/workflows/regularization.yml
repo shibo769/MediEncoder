@@ -53,7 +53,7 @@ jobs:
           python -m mediencoder.simulation.runner --output-dir prepared-run
           --reps 200 --target-reps "$TARGET_REPS" --device cpu --workers 2
           --arms mediencoder,mediencoder_l3zero --weight-decay "$WEIGHT_DECAY"
-          --mechanism-seed 910000 --seed-base 880000
+          --mechanism-seed 910000 --seed-base 880000 --loading-family haar
           --mechanism-from experiments/mechanisms/wavelet_seed910000 --summarize-only
       - name: Build a bounded synthetic mechanism artifact
         run: >-
@@ -94,14 +94,14 @@ jobs:
           python -m mediencoder.simulation.runner --output-dir prepared-artifact
           --reps 200 --target-reps "$TARGET_REPS" --device cpu --workers 2
           --arms mediencoder,mediencoder_l3zero --weight-decay "$WEIGHT_DECAY"
-          --mechanism-seed 910000 --seed-base 880000
+          --mechanism-seed 910000 --seed-base 880000 --loading-family haar
           --summarize-only
       - name: Measure one full-grid, full-epoch n100 fit at the prespecified weight decay
         run: >-
           timeout --signal=INT --kill-after=30s 25m
           python -m mediencoder.simulation.runner --output-dir canary-run
           --n 100 --arms mediencoder --reps 200 --target-reps 1 --max-tasks 1
-          --weight-decay "$WEIGHT_DECAY" --mechanism-seed 910000 --seed-base 880000
+          --weight-decay "$WEIGHT_DECAY" --mechanism-seed 910000 --seed-base 880000 --loading-family haar
           --mechanism-from prepared-artifact --device cpu --workers 1
       - name: Record the canary timing without treating it as formal results
         if: always()
@@ -146,7 +146,7 @@ jobs:
           python -m mediencoder.simulation.runner --output-dir shard-run
           --reps 200 --target-reps "$TARGET_REPS" --device cpu --workers 2
           --arms mediencoder,mediencoder_l3zero --weight-decay "$WEIGHT_DECAY"
-          --mechanism-seed 910000 --seed-base 880000
+          --mechanism-seed 910000 --seed-base 880000 --loading-family haar
           --tasks-per-worker 1 --shard-index "$SHARD_INDEX" --num-shards 50
       - name: Preserve completed synthetic checkpoints after failure or timeout
         if: always()

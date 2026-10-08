@@ -85,8 +85,10 @@ def fit_method(method, X, M, A, Y, *, seed, options=None, external_adapter=None)
                                     return_effects=True, numerical_safeguards=numerical_safeguards)
         result = {k: raw[k] for k in ("effects", "effect_se", "effect_ci", "effect_scores")}
         result.update(inference_available=True, implementation=f"canonical cross-fitted {method} representation / EIF")
-        if "effect_covariance" in raw:
-            result["effect_covariance"] = raw["effect_covariance"]
+        for key in ("effect_covariance", "effect_order", "effect_fold_score_covariances",
+                    "effect_variance_estimator", "fold_indices"):
+            if key in raw:
+                result[key] = raw[key]
         return validate_result(result)
     from . import baselines
     if method == "nath-adapted":

@@ -31,7 +31,9 @@ def test_actual_effect_pipeline_preserves_theta10_and_covariance(monkeypatch, tm
         assert base[key] == effects[key]
     for name, scores in effects["effect_scores"].items():
         assert scores.shape == (n,) and np.isfinite(scores).all()
-        np.testing.assert_allclose(effects["effect_se"][name], scores.std(ddof=1) / np.sqrt(n))
+        variance = sum(len(fold["estimation"]) * np.var(scores[fold["estimation"]], ddof=1)
+                       for fold in effects["fold_indices"]) / n**2
+        np.testing.assert_allclose(effects["effect_se"][name], np.sqrt(variance))
     np.testing.assert_allclose(effects["effects"]["TE"], effects["effects"]["NIE"] + effects["effects"]["NDE"])
 
     # Execute the real CLI through input loading, fitting and saved-score output.
@@ -47,4 +49,9 @@ def test_actual_effect_pipeline_preserves_theta10_and_covariance(monkeypatch, tm
     with np.load(output / "scores.npz", allow_pickle=False) as saved:
         for name in ("NIE", "NDE", "TE"):
             np.testing.assert_allclose(summary["effects"][name], saved[name].mean())
-            np.testing.assert_allclose(summary["effect_se"][name], saved[name].std(ddof=1) / np.sqrt(n))
+            folds = [saved[f"fold_{k+1}_estimation"] for k in range(4)]
+            variance = sum(len(indices) * np.var(saved[name][indices], ddof=1)
+                           for indices in folds) / n**2
+            np.testing.assert_allclose(summary["effect_se"][name], np.sqrt(variance))
+            np.testing.assert_allclose(summary["effect_ci"][name],
+                                       saved[name].mean() + np.array([-1, 1]) * 1.959963984540054 * np.sqrt(variance))

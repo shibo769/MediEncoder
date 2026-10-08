@@ -12,7 +12,8 @@ from mediencoder.simulation import dgp
 
 @pytest.fixture(scope="module")
 def mechanism():
-    return dgp.draw_parameters(dgp.DGPConfig(p=7, q=6, bar_p=2, bar_q=2, pilot_size=128), 910000)
+    return dgp.draw_parameters(dgp.DGPConfig(p=7, q=6, bar_p=2, bar_q=2,
+                                           pilot_size=128, loading_family="haar"), 910000)
 
 
 def test_one_dimensional_population_truth_against_independent_quadrature():

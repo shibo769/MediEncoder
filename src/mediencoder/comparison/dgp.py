@@ -1,6 +1,6 @@
 """Fixed polynomial comparison design from Supplementary Section S7.3.
 
-The main wavelet DGP is deliberately separate. Here treatment enters additively,
+The main interaction DGP is deliberately separate. Here treatment enters additively,
 the outcome is linear in latent mediators, and all natural effects have exact
 population truths. All structural and measurement coefficients are fixed once.
 """

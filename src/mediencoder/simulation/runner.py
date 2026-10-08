@@ -152,11 +152,15 @@ def make_config(args):
         estimand="population E[mu10(f_X)] conditional on fixed mechanism",
         mechanism_seed=args.mechanism_seed, seed_base=args.seed_base,
         n_values=args.n, B_requested=args.reps, methods=args.arms,
-        dgp=asdict(DGPConfig()), tilde_p=10, tilde_q=10,
+        dgp=asdict(DGPConfig(p=args.p, q=args.q,
+                            loading_family=getattr(args, "loading_family", "polynomial"))),
+        tilde_p=10, tilde_q=10,
         training=training_configuration(epochs, getattr(args, "weight_decay", 0.0)),
         lambda_grid=tune, lambda_grid_zero=zero,
-        stop_gradient=True, loss_normalization="observed representation-training fold only; validation reuses training scales",
-        interval="theta_hat +/- 1.959963984540054 * sd(crossfit_scores, ddof=1)/sqrt(n)",
+        stop_gradient=True, loss_normalization="none",
+        loss_reduction="mean_over_subjects_and_coordinates",
+        variance_estimator="within_fold_size_weighted",
+        interval="theta_hat +/- 1.959963984540054 * sqrt(sum_k(n_k * var(scores_in_fold_k, ddof=1))/n^2)",
         numeric_safeguards=dict(propensity_clip_eps=0.01, density_ratio_cap=0.0, density_ratio_soft_cap=0.0),
         device=args.device, torch_threads=1, deterministic_algorithms=True,
     ))
@@ -398,11 +402,19 @@ def _run_task(task):
         lower, upper = float(result["ci_lower"]), float(result["ci_upper"])
         if not all(map(math.isfinite, (truth, theta, se, lower, upper))) or se < 0:
             raise ValueError("Nonfinite point estimate/truth/interval or negative standard error")
-        expected_se = float(scores.std(ddof=1) / math.sqrt(len(scores)))
+        estimation_indices = [np.asarray(roles["estimation"]) for roles in result["fold_indices"]]
+        if len(estimation_indices) != 4 or any(
+                indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer)
+                or len(indices) < 2 for indices in estimation_indices):
+            raise ValueError("Four estimation folds with at least two subjects each are required")
+        if not np.array_equal(np.sort(np.concatenate(estimation_indices)), np.arange(len(scores))):
+            raise ValueError("Estimation folds must cover each saved score exactly once")
+        expected_se = float(np.sqrt(sum(len(indices) * np.var(scores[indices], ddof=1)
+                                        for indices in estimation_indices) / len(scores)**2))
         if not math.isclose(theta, float(scores.mean()), rel_tol=1e-9, abs_tol=1e-10):
             raise ValueError("Point estimate is not the mean of saved scores")
         if not math.isclose(se, expected_se, rel_tol=1e-9, abs_tol=1e-10):
-            raise ValueError("Standard error differs from the saved per-subject scores")
+            raise ValueError("Standard error differs from the saved within-fold score variances")
         if not (math.isclose(lower, theta - 1.959963984540054 * se, rel_tol=1e-9, abs_tol=1e-10)
                 and math.isclose(upper, theta + 1.959963984540054 * se, rel_tol=1e-9, abs_tol=1e-10)):
             raise ValueError("Saved confidence interval does not match per-dataset standard error")
@@ -424,7 +436,8 @@ def _run_task(task):
                       score_artifact_sha256=file_hash(artifact))
         keys = ("selected_lambda_A", "selected_lambda_B", "rep_fit_info", "rep_fit_info_by_half",
                 "fold_tuning", "resolved_config", "selected_beta_kl",
-                "estimator_contract", "fold_thetas", "fold_est_sizes")
+                 "estimator_contract", "fold_thetas", "fold_est_sizes",
+                 "variance_estimator", "fold_score_variances")
         record["estimator_metadata"] = {key: result[key] for key in keys if key in result}
     except Exception as exc:
         record.update(status="failed", error_type=type(exc).__name__, error_message=str(exc),
@@ -562,6 +575,10 @@ def parse_args(argv=None):
                         help="Recycle worker processes to release CPU/CUDA allocations (default 1)")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--n", type=lambda s: [int(x) for x in s.split(",")], default=[100,300,800,1200,2000,3000])
+    parser.add_argument("--p", type=int, default=2000, help="Number of observed covariates (default 2000)")
+    parser.add_argument("--q", type=int, default=1000, help="Number of observed mediators (default 1000)")
+    parser.add_argument("--loading-family", choices=("polynomial", "haar"), default="polynomial",
+                        help="Fixed measurement maps: additive degree-3 polynomial (default), or explicit legacy Haar")
     parser.add_argument("--reps", type=int, default=200)
     parser.add_argument("--target-reps", type=int, default=None,
                         help="Run/report only this replication prefix; later raise it up to reserved --reps without changing run identity")
@@ -589,6 +606,8 @@ def parse_args(argv=None):
         parser.error(str(exc))
     if args.tasks_per_worker < 1:
         parser.error("--tasks-per-worker must be positive")
+    if args.p < 1 or args.q < 1:
+        parser.error("--p and --q must be positive")
     if args.target_reps is not None and not 1 <= args.target_reps <= args.reps:
         parser.error("--target-reps must be between 1 and --reps")
     if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
@@ -633,7 +652,7 @@ def _main_locked(args):
     else:
         manifest.update(created_at=utc_now(), truth=mechanism.truth.to_dict(),
                         mechanism_provenance=mechanism_provenance,
-                        implementation_note="Paper/theory untouched. Fixed-mechanism population truth; observed-only train-fold scales; retained stop-gradient; dataset-specific IF intervals.")
+                        implementation_note="Paper/theory untouched. Fixed-mechanism population truth; raw MSE losses with simplex lambda weights; retained stop-gradient; dataset-specific within-fold IF intervals.")
         atomic_json(manifest_path, manifest)
     tasks = list(build_tasks(config))
     expected = {t["task_id"]: t for t in tasks}

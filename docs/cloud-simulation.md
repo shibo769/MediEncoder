@@ -1,7 +1,7 @@
 # Manual synthetic simulation on GitHub Actions
 
 The `Synthetic main and ablation simulation` workflow computes the first 50
-replications of the main wavelet experiment and alignment ablation. It is a
+replications of the main cubic-polynomial experiment and alignment ablation. It is a
 separate Linux CPU experiment. It never loads real data or combines the local
 CUDA experiment with cloud results.
 

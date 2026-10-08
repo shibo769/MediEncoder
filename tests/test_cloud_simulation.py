@@ -30,9 +30,10 @@ def make_artifacts(tmp_path, *, omit_task=False, changed_pairing=False, changed_
     cloud.package_artifact(prepared_source, prepared, "prepared", 2**20)
     shards = tmp_path / "shards"
     scores = params.truth.value + np.linspace(-0.2, 0.2, 40)
-    mean, se = float(scores.mean()), float(scores.std(ddof=1)/np.sqrt(40))
-    lower, upper = mean-1.959963984540054*se, mean+1.959963984540054*se
     split = np.array_split(np.arange(40), 4)
+    mean = float(scores.mean())
+    se = float(np.sqrt(sum(len(i) * np.var(scores[i], ddof=1) for i in split)) / 40)
+    lower, upper = mean-1.959963984540054*se, mean+1.959963984540054*se
     arrays = dict(crossfit_scores=scores, subject_index=np.arange(40))
     for fold in range(4):
         for offset, role in enumerate(("representation_train", "representation_validation", "nuisance", "estimation")):
@@ -78,6 +79,19 @@ def test_complete_cloud_merge_checks_scores_and_preserves_reservation(tmp_path):
     assert not audit["combined_with_local_gpu"]
     assert len(list((output / "scores").glob("*.npz"))) == 4
     assert (prepared / "manifest.json").read_bytes() == (output / "manifest.json").read_bytes()
+
+
+def test_score_audit_rejects_pooled_se_under_the_foldwise_contract(tmp_path):
+    _, shards = make_artifacts(tmp_path)
+    shard = shards / "shard-0"
+    path = next((shard / "tasks").glob("*.json"))
+    record = json.loads(path.read_text())
+    with np.load(shard / record["score_artifact"]) as saved:
+        pooled_se = float(saved["crossfit_scores"].std(ddof=1) / np.sqrt(record["n"]))
+    assert not np.isclose(record["se_IF"], pooled_se)
+    record["se_IF"] = pooled_se
+    with pytest.raises(ValueError, match="se_IF"):
+        cloud.validate_scores(record, shard, record["theta_population"])
 
 
 def test_incomplete_cloud_merge_preserves_available_records_without_success_claim(tmp_path):

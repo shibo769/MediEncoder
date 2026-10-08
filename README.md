@@ -12,7 +12,7 @@ src/mediencoder/
   training.py         # Coupled encoders, training losses, and tuning
   models.py           # Autoencoders, VAEs, and nuisance regressions
   nn_utils.py         # Neural-network construction and device selection
-  simulation/         # Fixed wavelet mechanism; main and ablation experiments
+  simulation/         # Fixed cubic mechanism; main and ablation experiments
   comparison/         # Separate polynomial experiment and comparison methods
   real_data/          # Observed-data loading, validation, and effect estimation
 scripts/              # Command-line entry points
@@ -42,6 +42,20 @@ wheel requires the corresponding PyTorch wheel index. CPU installations can use
 the ordinary package dependencies. Other version combinations are not certified.
 
 ## Main simulation and alignment ablation
+
+New main runs use fixed additive polynomial measurement maps of degree 3:
+`phi_k(f) = sum_j sum_{r=1}^3 C[k,j,r-1] * f[j]^r`, with independent Gaussian
+coefficients of variance `coef_scale^2 / 3`. X and M use separate loading streams.
+The treatment, latent mediator, outcome, structural-coefficient defaults and
+population-target calculation are unchanged. This loading-only update is not a
+reproduction of the earlier independently sampled-delta B20 experiment and does
+not modify loss normalization, lambda tuning, or archived results.
+
+Use `--loading-family haar` explicitly for a new run with the retained Haar
+generator or when importing an old Haar mechanism. Schema-1 saved mechanisms
+retain their original content hashes and loadings; a default polynomial run
+rejects an incompatible Haar import. Existing run manifests retain their source
+fingerprints and must be resumed with their original code snapshot.
 
 Start with a small execution check:
 

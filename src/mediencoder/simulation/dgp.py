@@ -1,12 +1,10 @@
-"""Fixed-mechanism version of the main wavelet simulation.
+"""Fixed-mechanism main simulation with additive cubic measurement loadings.
 
-This module does not change the legacy generator.  Its structural equations and
-parameter distributions follow that generator's interaction model.  Parameters,
-loadings and Haar atoms are sampled once, independently of every estimation
-dataset.  In particular, a prespecified independent latent pilot of size 4096
-sets the interval used to sample atom translations.  Its bounds are frozen; no
-observed outcome, estimator performance or estimation-sample extrema select them.
-This is an intentional fixed-DGP correction, not a bitwise legacy reproduction.
+New mechanisms use powers one through three with independent fixed Gaussian
+coefficients. Structural equations, parameter distributions and population truth
+are unchanged by this measurement-map choice. Haar loadings remain an explicit
+legacy option; schema-1 artifacts retain their original family and content hash.
+No estimation observations are used to draw either loading family.
 
 The population target is E[Y(1,M(0))].  All polynomial moments are analytic; only
 the smooth softplus expectation uses deterministic, successively refined tensor
@@ -25,8 +23,9 @@ import numpy as np
 from scipy.special import expit
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SUPPORT_RULE = "independent-fixed-latent-pilot-minmax"
+LOADING_FAMILIES = ("polynomial", "haar")
 
 
 @dataclass(frozen=True)
@@ -49,8 +48,11 @@ class DGPConfig:
     coef_scale_X: float = 1.0
     coef_scale_M: float = 1.0
     pilot_size: int = 4096
+    loading_family: str = "polynomial"
 
     def validate(self) -> None:
+        if self.loading_family not in LOADING_FAMILIES:
+            raise ValueError(f"loading_family must be one of {LOADING_FAMILIES}")
         for name in ("p", "q", "bar_p", "bar_q", "L", "pilot_size"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
@@ -96,12 +98,20 @@ class Mechanism:
     arrays: dict[str, np.ndarray] = field(repr=False)
     metadata: dict[str, Any]
     truth: TruthResult | None = None
+    schema_version: int = SCHEMA_VERSION
+
+    def serialized_config(self) -> dict[str, Any]:
+        config = asdict(self.config)
+        if self.schema_version == 1:
+            # Schema 1 predates the family field. Keep its exact hashed payload.
+            config.pop("loading_family")
+        return config
 
     @property
     def mechanism_hash(self) -> str:
         """Hash the complete numerical mechanism and cached truth, not file bytes."""
         h = sha256()
-        payload = {"schema_version": SCHEMA_VERSION, "config": asdict(self.config),
+        payload = {"schema_version": self.schema_version, "config": self.serialized_config(),
                    "parameter_seed": self.parameter_seed, "metadata": self.metadata,
                    "truth": None if self.truth is None else self.truth.to_dict()}
         h.update(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode())
@@ -200,22 +210,35 @@ def draw_parameters(config: DGPConfig | dict[str, Any] | None = None,
     arrays["Sigma_U"] = Q @ np.diag(eigenvalues) @ Q.T
     for name in ("beta_0", "beta_1", "gamma_0", "gamma_1", "kappa_0", "kappa_1"):
         arrays[name] = rng.uniform(0.5, 1.5, size=d)
-    provisional = Mechanism(c, parameter_seed, arrays, {})
-    pilot = _sample_latent(provisional, c.pilot_size, pilot_seed)
-    low = float(min(pilot["f_X"].min(), pilot["f_M"].min()))
-    high = float(max(pilot["f_X"].max(), pilot["f_M"].max()))
-    rng = np.random.default_rng(loading_seed)
-    r_list = rng.integers(c.r_min, c.r_max + 1, size=c.L, dtype=np.int64)
-    s_list = np.array([int(np.round((2.0 ** r) * rng.uniform(low, high) + rng.uniform(-1, 1)))
-                       for r in r_list], dtype=np.int64)
-    arrays.update(r_list=r_list, s_list=s_list,
-                  Lambda_X_coef=rng.normal(0, c.coef_scale_X / np.sqrt(c.L), size=(c.p, d, c.L)),
-                  Lambda_M_coef=rng.normal(0, c.coef_scale_M / np.sqrt(c.L), size=(c.q, d, c.L)))
-    metadata = {"support_rule": SUPPORT_RULE, "pilot_size": c.pilot_size,
-                "pilot_seed": pilot_seed, "support_bounds": [low, high],
+    metadata = {"loading_family": c.loading_family,
                 "structural_seed": structural_seed, "loading_seed": loading_seed,
                 "generator": "numpy.PCG64", "numpy_version_at_creation": np.__version__,
-                "design_note": "Fixed independent pilot and parameter streams; not legacy bitwise reproduction."}
+                "design_note": "Fixed independent parameter and loading streams; no estimation-data calibration."}
+    if c.loading_family == "polynomial":
+        loading_X_seed, loading_M_seed = _stream_seeds(loading_seed, 0x504F4C59, 2)
+        arrays.update(
+            polynomial_X=np.random.default_rng(loading_X_seed).normal(
+                0, c.coef_scale_X / np.sqrt(3), size=(c.p, d, 3)),
+            polynomial_M=np.random.default_rng(loading_M_seed).normal(
+                0, c.coef_scale_M / np.sqrt(3), size=(c.q, d, 3)))
+        metadata.update(polynomial_degree=3,
+                        polynomial_formula="sum_j sum_{r=1}^3 C[k,j,r-1]*f[j]^r",
+                        loading_X_seed=loading_X_seed, loading_M_seed=loading_M_seed,
+                        inactive_config_fields=["L", "r_min", "r_max", "pilot_size"])
+    else:
+        provisional = Mechanism(c, parameter_seed, arrays, {})
+        pilot = _sample_latent(provisional, c.pilot_size, pilot_seed)
+        low = float(min(pilot["f_X"].min(), pilot["f_M"].min()))
+        high = float(max(pilot["f_X"].max(), pilot["f_M"].max()))
+        rng = np.random.default_rng(loading_seed)
+        r_list = rng.integers(c.r_min, c.r_max + 1, size=c.L, dtype=np.int64)
+        s_list = np.array([int(np.round((2.0 ** r) * rng.uniform(low, high) + rng.uniform(-1, 1)))
+                           for r in r_list], dtype=np.int64)
+        arrays.update(r_list=r_list, s_list=s_list,
+                      Lambda_X_coef=rng.normal(0, c.coef_scale_X / np.sqrt(c.L), size=(c.p, d, c.L)),
+                      Lambda_M_coef=rng.normal(0, c.coef_scale_M / np.sqrt(c.L), size=(c.q, d, c.L)))
+        metadata.update(support_rule=SUPPORT_RULE, pilot_size=c.pilot_size,
+                        pilot_seed=pilot_seed, support_bounds=[low, high])
     params = Mechanism(c, parameter_seed, _freeze(arrays), metadata)
     truth = population_truth(params)
     return Mechanism(c, parameter_seed, params.arrays, metadata, truth)
@@ -289,6 +312,17 @@ def _loading(factors: np.ndarray, coefficients: np.ndarray,
     return result
 
 
+def _polynomial_loading(factors: np.ndarray, coefficients: np.ndarray) -> np.ndarray:
+    """Additive cubic map: sum_j sum_{r=1}^3 C[k,j,r-1] * factors[j]**r."""
+    if coefficients.ndim != 3 or coefficients.shape[1:] != (factors.shape[1], 3):
+        raise ValueError("Cubic coefficients must have shape (observed_dim, latent_dim, 3)")
+    result = np.zeros((len(factors), coefficients.shape[0]))
+    for j in range(factors.shape[1]):
+        basis = np.column_stack([factors[:, j] ** power for power in (1, 2, 3)])
+        result += basis @ coefficients[:, j, :].T
+    return result
+
+
 def sample_data(params: Mechanism, n: int, data_seed: int) -> dict[str, Any]:
     """Sample one dataset; oracle information is deliberately nested separately.
 
@@ -303,8 +337,14 @@ def sample_data(params: Mechanism, n: int, data_seed: int) -> dict[str, Any]:
     c, a = params.config, params.arrays
     latent = _sample_latent(params, int(n), data_seed)
     noise_seeds = _stream_seeds(data_seed, 0x4D454153, 2)
-    X = _loading(latent["f_X"], a["Lambda_X_coef"], a["r_list"], a["s_list"])
-    M = _loading(latent["f_M"], a["Lambda_M_coef"], a["r_list"], a["s_list"])
+    if c.loading_family == "polynomial":
+        X = _polynomial_loading(latent["f_X"], a["polynomial_X"])
+        M = _polynomial_loading(latent["f_M"], a["polynomial_M"])
+    elif c.loading_family == "haar":
+        X = _loading(latent["f_X"], a["Lambda_X_coef"], a["r_list"], a["s_list"])
+        M = _loading(latent["f_M"], a["Lambda_M_coef"], a["r_list"], a["s_list"])
+    else:
+        raise ValueError(f"Unsupported loading family: {c.loading_family}")
     X += np.random.default_rng(noise_seeds[0]).normal(0, c.sigma_eps_X, (n, c.p))
     M += np.random.default_rng(noise_seeds[1]).normal(0, c.sigma_eps_M, (n, c.q))
     oracle = {k: v for k, v in latent.items() if k not in ("A", "Y")}
@@ -326,7 +366,7 @@ def save_mechanism(params: Mechanism, path_prefix: str | Path) -> dict[str, str]
     json_path, npz_path = _artifact_paths(path_prefix)
     json_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(npz_path, **params.arrays)
-    payload = {"schema_version": SCHEMA_VERSION, "config": asdict(params.config),
+    payload = {"schema_version": params.schema_version, "config": params.serialized_config(),
                "parameter_seed": params.parameter_seed, "metadata": params.metadata,
                "truth": params.truth.to_dict(), "mechanism_hash": params.mechanism_hash,
                "array_names": sorted(params.arrays), "arrays_file": npz_path.name}
@@ -338,11 +378,23 @@ def load_mechanism(path_prefix: str | Path) -> Mechanism:
     """Load and verify artifact content, without recalculating quadrature."""
     json_path, npz_path = _artifact_paths(path_prefix)
     payload = json.loads(json_path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if schema_version not in (1, SCHEMA_VERSION):
         raise ValueError("Unsupported mechanism artifact schema")
     if payload.get("arrays_file") != npz_path.name:
         raise ValueError("Mechanism JSON/NPZ file names do not match")
-    config = DGPConfig(**payload["config"])
+    config_data = dict(payload["config"])
+    if schema_version == 1:
+        if "loading_family" in config_data:
+            raise ValueError("Schema-1 artifacts cannot contain a loading_family field")
+        legacy_family = payload["metadata"].get("exploration_measurement", "wavelet")
+        families = {"wavelet": "haar", "polynomial_degree3": "polynomial"}
+        if legacy_family not in families:
+            raise ValueError(f"Unsupported legacy measurement family: {legacy_family}")
+        config_data["loading_family"] = families[legacy_family]
+    elif "loading_family" not in config_data:
+        raise ValueError("Schema-2 artifacts must specify loading_family")
+    config = DGPConfig(**config_data)
     config.validate()
     with np.load(npz_path, allow_pickle=False) as archive:
         if sorted(archive.files) != payload["array_names"]:
@@ -354,7 +406,8 @@ def load_mechanism(path_prefix: str | Path) -> Mechanism:
     truth = TruthResult(**truth_data)
     if not truth.converged or not np.isfinite(truth.value):
         raise ValueError("Mechanism truth must be converged and finite")
-    params = Mechanism(config, _seed(payload["parameter_seed"], "parameter_seed"), arrays, payload["metadata"], truth)
+    params = Mechanism(config, _seed(payload["parameter_seed"], "parameter_seed"), arrays,
+                       payload["metadata"], truth, schema_version)
     if params.mechanism_hash != payload["mechanism_hash"]:
         raise ValueError("Mechanism content hash mismatch")
     return params

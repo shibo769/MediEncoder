@@ -40,6 +40,26 @@ class CorrectedRunnerTests(unittest.TestCase):
         self.assertNotEqual(tasks[0]["data_seed"], tasks[2]["data_seed"])
         self.assertEqual(tasks, list(runner.build_tasks(config)))
 
+    def test_requested_observed_dimensions_are_recorded_without_changing_defaults(self):
+        runner.configure_environment("cpu")
+        from mediencoder.estimation import SHARED_TRAIN_CFG
+        previous = dict(SHARED_TRAIN_CFG)
+        try:
+            args = runner.parse_args(["--output-dir", "unused", "--p", "1000", "--q", "1000",
+                                      "--n", "800,1500", "--reps", "50",
+                                      "--arms", "mediencoder,mediencoder_l3zero"])
+            config = runner.make_config(args)
+            self.assertEqual((config["dgp"]["p"], config["dgp"]["q"]), (1000, 1000))
+            self.assertEqual(len(list(runner.build_tasks(config))), 200)
+            default = runner.make_config(runner.parse_args(["--output-dir", "unused"]))
+            self.assertEqual((default["dgp"]["p"], default["dgp"]["q"]), (2000, 1000))
+            for option in ("--p", "--q"):
+                with self.assertRaises(SystemExit):
+                    runner.parse_args(["--output-dir", "unused", option, "0"])
+        finally:
+            SHARED_TRAIN_CFG.clear()
+            SHARED_TRAIN_CFG.update(previous)
+
     def test_execution_target_preserves_reservation_and_existing_task_seeds(self):
         config = self.config()
         before = json.dumps(config, sort_keys=True)

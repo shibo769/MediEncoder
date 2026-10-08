@@ -11,7 +11,7 @@ historical checkpoints silently.
 | `MediEncoder_and_Train.py` | `mediencoder.training` |
 | `nn_utils.py` | `mediencoder.nn_utils` |
 | `run_and_eval.py` | `mediencoder.estimation` |
-| main wavelet generator in `DGP_and_estimate.py` | `mediencoder.simulation.dgp` |
+| main wavelet generator in `DGP_and_estimate.py` | `mediencoder.simulation.dgp` (new default: degree-3 polynomial; explicit `--loading-family haar` retains Haar) |
 | `simulation/run_tables_b400.py` | `python -m mediencoder.simulation.runner` (200 default) |
 | local real-data crossfit/multiseed/bootstrap prototypes | documented `real_data` workflow |
 | local comparison driver and MC-default table writer | documented `comparison` workflow |

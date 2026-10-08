@@ -57,11 +57,13 @@ def render_report(output):
     by = {(int(r['n']), r['method']): r for r in rows}
     sizes = sorted({int(r['n']) for r in rows})
     labels = {'projection': 'Projection', 'autoencoder': 'Autoencoder', 'vae': 'VAE',
-              'mediencoder': 'MediEncoder'}
+              'mediencoder': 'MediEncoder', 'mediencoder_l3zero': 'MediEncoder (lambda3=0)'}
     main = []
     ablation = []
     for n in sizes:
         for method, name in labels.items():
+            if method not in config.get('methods', labels):
+                continue
             r = by.get((n, method), {})
             metrics = ''.join('<td>' + cell(r.get(k)) + '</td>' for k in ('SD', 'RMSE', 'CI_Length', 'Coverage'))
             counts = f"{r.get('B_completed', 0)} / {r.get('B_requested', target)}; failed {r.get('B_failed', 0)}"
@@ -85,7 +87,7 @@ def render_report(output):
 <meta http-equiv="refresh" content="60"><title>{title}</title>
 <style>body{{font:16px/1.5 system-ui,sans-serif;max-width:1200px;margin:40px auto;padding:0 24px;color:#172033;background:#f7f8fa}}h1{{font-size:28px}}h2{{font-size:22px;margin-top:36px}}table{{border-collapse:collapse;width:100%;background:white;font-variant-numeric:tabular-nums}}th,td{{padding:9px 12px;border-bottom:1px solid #dbe0e7;text-align:right}}th{{background:#eaf0f6}}td:nth-child(2){{text-align:left}}.status{{padding:16px;background:#eaf0f6;border-radius:8px}}.note{{color:#4c5667}}a{{color:#175ca8}}</style>
 <h1>{title}</h1><p class="status"><b>{completed:,} valid / {requested:,} planned fits</b>; {failed} failed; {pending:,} pending. Phase: {html.escape(phase)}.<br>Updated {stamp} (UTC). This page refreshes every minute.</p>
-<p>p={cell(dgp.get('p'))}, q={cell(dgp.get('q'))}; latent dimensions {cell(dgp.get('bar_p'))}/{cell(dgp.get('bar_q'))}; learned dimensions {cell(config.get('tilde_p'))}/{cell(config.get('tilde_q'))}; {target} replications per size and arm in this execution phase, with {reserved} reserved. Run kind: {html.escape(config.get('run_kind', 'starting'))}. Fixed mechanism; population truth; observed-only training scales; retained stop-gradient; dataset-specific influence-function confidence intervals.</p>
+<p>p={cell(dgp.get('p'))}, q={cell(dgp.get('q'))}; latent dimensions {cell(dgp.get('bar_p'))}/{cell(dgp.get('bar_q'))}; learned dimensions {cell(config.get('tilde_p'))}/{cell(config.get('tilde_q'))}; {target} replications per size and arm in this execution phase, with {reserved} reserved. Run kind: {html.escape(config.get('run_kind', 'starting'))}. Fixed mechanism; population truth; loss normalization: {html.escape(str(config.get('loss_normalization', 'not recorded')))}; retained stop-gradient; dataset-specific within-fold influence-function confidence intervals.</p>
 <p class="note">Partial estimates are provisional. Coverage is conditional on valid completed replications. The two tables reuse the same tuned MediEncoder fits. No manuscript or proof has been changed.</p>
 <h2>Main comparison</h2><table><thead><tr><th>n</th><th>Estimator</th><th>SD</th><th>RMSE</th><th>CI length</th><th>Coverage</th><th>Valid / planned; failures</th></tr></thead><tbody>{''.join(main)}</tbody></table>
 <h2>Alignment ablation</h2><table><thead><tr><th></th><th colspan="2">SD</th><th colspan="2">RMSE</th><th colspan="2">CI length</th><th>Valid counts</th></tr><tr><th>n</th><th>lambda3=0</th><th>Tuning</th><th>lambda3=0</th><th>Tuning</th><th>lambda3=0</th><th>Tuning</th><th>Zero / tuning</th></tr></thead><tbody>{''.join(ablation)}</tbody></table>

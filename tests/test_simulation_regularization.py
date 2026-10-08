@@ -192,7 +192,7 @@ def test_resume_rejects_a_different_import_or_changed_saved_artifacts(
     _, provenance = runner.prepare_mechanism(output, mechanism_config(mechanism), mechanism_from=mechanism_source)
     manifest = {"mechanism_hash": mechanism.mechanism_hash, "mechanism_provenance": provenance}
     arrays = {key: value.copy() for key, value in mechanism.arrays.items()}
-    arrays["Lambda_X_coef"] *= 2
+    arrays["polynomial_X"] *= 2
     changed = replace(mechanism, arrays=arrays)
     other = tmp_path / "other"
     other.mkdir()

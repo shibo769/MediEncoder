@@ -86,7 +86,9 @@ environment settings. Prespecified changes use `--clip-eps`, `--pi2-soft`, or
 be selected together. Such truncation choices can affect bias and must be
 reported with the analysis; finite weights do not establish population overlap.
 
-The coupled loss scales also use only observed representation-training data.
+The coupled losses use raw MSE, without variance normalization, and the three
+lambda weights sum to one. This does not alter the separate input-preprocessing
+option described above.
 Stop-gradient alignment and reconstruction-based checkpointing are retained;
 this release does not claim that those updates solve the ordinary joint scalar
 minimization written in older manuscript versions.
@@ -120,9 +122,11 @@ Natural effects follow the manuscript's treatment-1 convention:
 
 Every subject must contribute exactly one finite score to each component.
 Nonfinite scores fail the analysis; they are never silently removed. For each
-effect, the estimate is its score mean and the SE is the sample standard deviation
-of those scores divided by `sqrt(n)`. The program saves the full effect covariance
-matrix `sample_covariance(effect_scores) / n`. This includes covariance between
+effect, the estimate is its score mean and the SE is
+`sqrt(sum_k(n_k * var(effect_scores_in_fold_k, ddof=1)) / n**2)`.
+Each variance centers scores within its evaluation fold. The program saves the
+full effect covariance matrix `sum_k(n_k * sample_covariance_in_fold_k) / n**2`,
+the individual fold covariance matrices, and the variance method. This includes covariance between
 components; it does not add component variances as if they were independent.
 Intervals use the standard normal 0.975 quantile. Identification and asymptotic
 validity still require the causal, overlap, representation, and nuisance-rate

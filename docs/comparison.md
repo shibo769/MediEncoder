@@ -17,7 +17,8 @@ scientific protocol and resulting diagnostics have been reviewed.
 ## Fixed polynomial mechanism
 
 This comparison preserves the paper's additive, no-interaction comparison
-model, separate from the main wavelet simulation:
+model, separate from the main simulation with treatment-specific mediator and
+outcome equations (both now use cubic measurement maps):
 
 ```
 f_X ~ Uniform([-1,1]^3)

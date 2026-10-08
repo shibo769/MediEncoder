@@ -31,12 +31,15 @@ dependency on the previous run's expiring GitHub artifact.
 
 Weight decay applies to the representation networks, auxiliary outcome regressions
 used for tuning, and nuisance regressions. It is not restricted to the encoders.
-Stop-gradient alignment, observable training-fold loss scales, reconstruction
+In that historical run, stop-gradient alignment, observable training-fold loss scales, reconstruction
 checkpointing, network widths, learning rate, batch size, and propensity safeguards
-retain their existing settings. Each dataset's confidence interval uses its own
+retained their existing settings. Each dataset's confidence interval uses its own
 cross-fitted scores. The manifest records the effective training settings and
 scientific source hashes; this experiment has a new run identity and output
-directory.
+directory. Subsequent code changes on October 6 removed coupled-loss variance
+normalization and adopted within-fold score variance. The current code therefore
+defines a new experiment and cannot resume or reproduce this historical
+weight-decay-only run without its frozen source snapshot.
 
 The retained mechanism has a known limitation: only one of its five shared Haar
 atoms has nonzero support on the covariate factors' interval `[-1,1]`. Its
