@@ -156,8 +156,8 @@ class EstimationContractTests(unittest.TestCase):
                 hidden_dims_X=(4,), hidden_dims_M=(4,), hidden_dims_XM=(4,),
                 activation="tanh", scheduler_type="none", verbose=False)
         self.assertGreater(alignment.call_count, 0)
-        self.assertEqual(info["loss_normalization"], "none")
-        for key in ("loss_X", "loss_M", "loss_align", "weighted_loss"):
+        self.assertEqual(info["loss_normalization"], "alignment_row_l2")
+        for key in ("loss_X", "loss_M"):
             np.testing.assert_allclose(history[key], history["raw_" + key])
         self.assertEqual(info["checkpoint_criterion"], "reconstruction")
         device = next(model.parameters()).device

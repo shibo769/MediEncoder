@@ -4,8 +4,8 @@
 # MediEncoder training module
 #
 # Main points:
-#   1. Train with raw MSE losses; no variance or other data-dependent divisors.
-#      MSE still averages over subjects and coordinates.
+#   1. Reconstruction uses raw MSE; alignment compares row-L2-normalized codes.
+#      MSE averages over subjects and coordinates.
 #   2. Validation checkpointing uses reconstruction (+ KL for MediVAE).
 #   3. Rich history / metadata recording for later analysis
 #   4. Lambda helpers support:
@@ -22,6 +22,10 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from mediencoder.nn_utils import build_mlp, device
+
+
+ALIGNMENT_NORMALIZATION = "row_l2"
+ALIGNMENT_NORM_EPS = 1e-8
 
 
 # ============================================================
@@ -462,8 +466,20 @@ def _validate_coupled_inputs(X_train, M_train):
 # ============================================================
 
 def _alignment_loss(z_M, z_M_pred):
-    """Retained stop-gradient update: only the prediction branch receives gradients."""
-    return nn.functional.mse_loss(z_M.detach(), z_M_pred)
+    """Compare each subject's code direction, retaining the detached target.
+
+    Each branch is divided by its own L2 norm across latent coordinates, with
+    the norm clamped below by ALIGNMENT_NORM_EPS. For nonzero rows above this
+    threshold, independently multiplying either branch by a positive scalar
+    leaves the loss unchanged. Magnitudes are not constrained by alignment.
+    """
+    target = nn.functional.normalize(
+        z_M.detach(), p=2, dim=1, eps=ALIGNMENT_NORM_EPS
+    )
+    prediction = nn.functional.normalize(
+        z_M_pred, p=2, dim=1, eps=ALIGNMENT_NORM_EPS
+    )
+    return nn.functional.mse_loss(target, prediction)
 
 
 def train_mediencoder(
@@ -507,14 +523,15 @@ def train_mediencoder(
     allow_unbalanced_lambda=False,
 ):
     """
-    Train MediEncoder using raw MSE losses without variance normalization.
+    Train MediEncoder using raw reconstruction and normalized alignment MSE.
 
     Objective:
         lambda1 * mse(X_recon, X)
       + lambda2 * mse(M_recon, M)
-      + lambda3 * mse(stop_gradient(z_M), z_M_pred)
+      + lambda3 * mse(row_unit(stop_gradient(z_M)), row_unit(z_M_pred))
 
     Each MSE averages over subjects and coordinates; lambda weights sum to one.
+    row_unit divides each row by max(its L2 norm, ALIGNMENT_NORM_EPS).
 
     If validation data are supplied, choose the checkpoint using weighted
     reconstruction loss only, without variance divisors.
@@ -654,11 +671,11 @@ def train_mediencoder(
             # to PREDICT the mediator code, not drag encoder_M's code down to be
             # predictable. Without detach the gradient collapses z_M's scale
             # (std ~0.2 vs ~2.7), destroying the arm-difference and the NIE.
-            raw_loss_align = _alignment_loss(z_M, z_M_pred)
+            raw_loss_align = mse_fn(z_M.detach(), z_M_pred)
 
             loss_X = raw_loss_X
             loss_M = raw_loss_M
-            loss_align = raw_loss_align
+            loss_align = _alignment_loss(z_M, z_M_pred)
 
             weighted_loss = (
                 lambda1 * loss_X +
@@ -727,11 +744,8 @@ def train_mediencoder(
                 out_v = model(X_val_t, M_val_t, A_val_t)
                 v_X = mse_fn(out_v["X_recon"], X_val_t).item()
                 v_M = mse_fn(out_v["M_recon"], M_val_t).item()
-                # Checkpoint on RECONSTRUCTION only. The align term is
-                # minimized by a near-init tiny-scale z_M, so including it
-                # makes early-stopping pick a collapsed encoder_M (best_ep~0)
-                # and destroys the arm-difference / NIE. Selection over lambda
-                # is what weighs alignment; the checkpoint just avoids overfit.
+                # Retain reconstruction-only checkpoint selection. Lambda
+                # selection evaluates alignment through held-out prediction.
                 monitor = lambda1 * v_X + lambda2 * v_M
             history["val_weighted_loss"].append(monitor)
 
@@ -765,7 +779,10 @@ def train_mediencoder(
 
     fit_info = {
         "alignment_stop_gradient": True,
-        "loss_normalization": "none",
+        "loss_normalization": "alignment_row_l2",
+        "reconstruction_loss_normalization": "none",
+        "alignment_normalization": ALIGNMENT_NORMALIZATION,
+        "alignment_norm_eps": ALIGNMENT_NORM_EPS,
         "loss_reduction": "mean_over_subjects_and_coordinates",
         "checkpoint_criterion": "reconstruction" if use_val else "training_weighted_loss",
         "lambda1": float(lambda1),
@@ -893,15 +910,16 @@ def train_mediencoder_vae(
     allow_unbalanced_lambda=False,
 ):
     """
-    Train MediEncoderVAE using raw MSE losses + KL divergence.
+    Train MediEncoderVAE with raw reconstruction, normalized alignment, and KL.
 
     Objective:
         lambda1 * mse(X_recon, X)
       + lambda2 * mse(M_recon, M)
-      + lambda3 * mse(stop_gradient(z_M), z_M_pred)
+      + lambda3 * mse(row_unit(stop_gradient(z_M)), row_unit(z_M_pred))
       + beta_kl * (KL_X + KL_M)
 
-    No MSE term is divided by a variance; lambda weights sum to one.
+    row_unit divides each row by max(its L2 norm, ALIGNMENT_NORM_EPS).
+    Reconstruction MSE is unnormalized; lambda weights sum to one.
     """
 
     if allow_unbalanced_lambda:
@@ -1033,14 +1051,14 @@ def train_mediencoder_vae(
 
             raw_loss_X = mse_fn(out["X_recon"], xb)
             raw_loss_M = mse_fn(out["M_recon"], mb)
-            raw_loss_align = _alignment_loss(out["z_M"], out["z_M_pred"])
+            raw_loss_align = mse_fn(out["z_M"].detach(), out["z_M_pred"])
 
             kl_X = kl_divergence_standard_normal(out["mu_X"], out["logvar_X"])
             kl_M = kl_divergence_standard_normal(out["mu_M"], out["logvar_M"])
 
             loss_X = raw_loss_X
             loss_M = raw_loss_M
-            loss_align = raw_loss_align
+            loss_align = _alignment_loss(out["z_M"], out["z_M_pred"])
 
             weighted_loss = (
                 lambda1 * loss_X +
@@ -1168,7 +1186,10 @@ def train_mediencoder_vae(
 
     fit_info = {
         "alignment_stop_gradient": True,
-        "loss_normalization": "none",
+        "loss_normalization": "alignment_row_l2",
+        "reconstruction_loss_normalization": "none",
+        "alignment_normalization": ALIGNMENT_NORMALIZATION,
+        "alignment_norm_eps": ALIGNMENT_NORM_EPS,
         "loss_reduction": "mean_over_subjects_and_coordinates",
         "checkpoint_criterion": "reconstruction_plus_kl" if use_val else "training_weighted_loss",
         "lambda1": float(lambda1),

@@ -12,6 +12,8 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from mediencoder.nn_utils import build_mlp, device
 
+DEFAULT_NUISANCE_HIDDEN = (300, 300)
+
 # ============================================================
 # 1) Generic NN for nuisance
 # ============================================================
@@ -22,7 +24,7 @@ class DeepNN(nn.Module):
         self,
         input_dim,
         output_dim=1,
-        hidden_dims=(300, 300, 300),
+        hidden_dims=DEFAULT_NUISANCE_HIDDEN,
         activation="relu",
         dropout=0.0
     ):
@@ -55,7 +57,7 @@ def train_nuisance_nn(
     weight_decay=0.0,
     betas=(0.9, 0.999),
     eps=1e-8,
-    hidden_dims=(300, 300, 300),
+    hidden_dims=DEFAULT_NUISANCE_HIDDEN,
     activation="relu",
     dropout=0.0,
     batch_size=512,

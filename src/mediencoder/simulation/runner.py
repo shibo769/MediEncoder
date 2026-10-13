@@ -123,18 +123,19 @@ def validate_weight_decay(value):
 
 
 def training_configuration(epochs, weight_decay=0.0):
-    from mediencoder.estimation import SHARED_ADAM_EPS, SHARED_HIDDEN, SHARED_TRAIN_CFG, _shared_cfg
+    from mediencoder.estimation import (SHARED_ADAM_EPS, SHARED_HIDDEN, SHARED_NUISANCE_HIDDEN,
+                                       SHARED_TRAIN_CFG, _shared_cfg)
     # The existing implementation intentionally forbids per-method overrides.
     # Set the one shared cap before resolving ALL learners, including nuisance fits.
     SHARED_TRAIN_CFG["epochs"] = int(epochs)
     SHARED_TRAIN_CFG["weight_decay"] = validate_weight_decay(weight_decay)
     return dict(
-        nn_cfg=_shared_cfg(eps=SHARED_ADAM_EPS, hidden_dims=(300, 300, 300)),
+        nn_cfg=_shared_cfg(eps=SHARED_ADAM_EPS, hidden_dims=SHARED_NUISANCE_HIDDEN),
         ae_cfg=_shared_cfg(eps=SHARED_ADAM_EPS, hidden_dims_X=SHARED_HIDDEN,
                            hidden_dims_M=SHARED_HIDDEN, beta_kl=0.5),
         me_cfg=_shared_cfg(hidden_dims_X=SHARED_HIDDEN, hidden_dims_M=SHARED_HIDDEN,
                            hidden_dims_XM=(50, 50), adam_eps=SHARED_ADAM_EPS,
-                           lambda1=0.2, lambda2=0.5, lambda3=0.3, beta_kl=0.5,
+                           lambda1=0.45, lambda2=0.45, lambda3=0.10, beta_kl=0.5,
                            return_history=True, allow_unbalanced_lambda=True),
         encode_cfg=dict(batch_size=4096),
     )
@@ -142,22 +143,33 @@ def training_configuration(epochs, weight_decay=0.0):
 
 def make_config(args):
     from mediencoder.simulation.dgp import DGPConfig
+    from mediencoder.training import ALIGNMENT_NORMALIZATION, ALIGNMENT_NORM_EPS
     from dataclasses import asdict
-    tune, zero = lambda_grids()
+    mode = getattr(args, "lambda_mode", "fixed")
+    tune, zero = (lambda_grids() if mode == "grid" else
+                  ([list(args.lambda_fixed)], [list(args.lambda_fixed_zero)]))
     pilot = args.pilot_epochs is not None
     epochs = args.pilot_epochs if pilot else 300
+    training = training_configuration(epochs, getattr(args, "weight_decay", 0.0))
+    if mode == "fixed" and training:
+        for key, value in zip(("lambda1", "lambda2", "lambda3"), tune[0]):
+            training["me_cfg"][key] = value
     return jsonable(dict(
-        schema_version=1, run_kind=("PILOT_NOT_FOR_PAPER" if pilot else
+        schema_version=2, run_kind=("PILOT_NOT_FOR_PAPER" if pilot else
                                    "BENCHMARK_NOT_FOR_PAPER" if args.max_tasks is not None else "FORMAL"),
         estimand="population E[mu10(f_X)] conditional on fixed mechanism",
         mechanism_seed=args.mechanism_seed, seed_base=args.seed_base,
         n_values=args.n, B_requested=args.reps, methods=args.arms,
         dgp=asdict(DGPConfig(p=args.p, q=args.q,
+                            alpha_upper=args.alpha_upper, delta1_spread=args.delta1_spread,
+                            delta1_shift=args.delta1_shift, delta1_contrast=args.delta1_contrast,
                             loading_family=getattr(args, "loading_family", "polynomial"))),
         tilde_p=10, tilde_q=10,
-        training=training_configuration(epochs, getattr(args, "weight_decay", 0.0)),
-        lambda_grid=tune, lambda_grid_zero=zero,
-        stop_gradient=True, loss_normalization="none",
+        training=training,
+        lambda_mode=mode, lambda_grid=tune, lambda_grid_zero=zero,
+        stop_gradient=True, loss_normalization="alignment_row_l2",
+        reconstruction_loss_normalization="none", alignment_normalization=ALIGNMENT_NORMALIZATION,
+        alignment_norm_eps=ALIGNMENT_NORM_EPS,
         loss_reduction="mean_over_subjects_and_coordinates",
         variance_estimator="within_fold_size_weighted",
         interval="theta_hat +/- 1.959963984540054 * sqrt(sum_k(n_k * var(scores_in_fold_k, ddof=1))/n^2)",
@@ -366,6 +378,24 @@ def observed_data_hash(data):
     return h.hexdigest()
 
 
+def task_estimation_options(config, task, training):
+    """Resolve an arm's fixed weights or tuning grid without mutating the manifest."""
+    options = {name: dict(settings) for name, settings in training.items()}
+    method = "mediencoder" if task["method"] == "mediencoder_l3zero" else task["method"]
+    grid = None
+    if method == "mediencoder":
+        candidates = config["lambda_grid_zero"] if task["method"].endswith("l3zero") else config["lambda_grid"]
+        if config.get("lambda_mode", "grid") == "fixed":
+            if len(candidates) != 1:
+                raise ValueError("Fixed lambda mode requires exactly one recorded weight triple per arm")
+            for key, value in zip(("lambda1", "lambda2", "lambda3"), candidates[0]):
+                options["me_cfg"][key] = value
+            options["fixed_lambda"] = tuple(candidates[0])
+        else:
+            grid = candidates
+    return method, grid, options
+
+
 def _run_task(task):
     import numpy as np
     from mediencoder.simulation.dgp import sample_data
@@ -385,15 +415,12 @@ def _run_task(task):
         truth = float(_WORKER["mechanism"].truth.value)
         # True factors/nuisances are intentionally unavailable to the estimator call.
         data.pop("oracle", None)
-        method = "mediencoder" if task["method"] == "mediencoder_l3zero" else task["method"]
-        grid = None
-        if method == "mediencoder":
-            grid = config["lambda_grid_zero"] if task["method"].endswith("l3zero") else config["lambda_grid"]
+        method, grid, options = task_estimation_options(config, task, _WORKER["training"])
         set_all_seeds(task["training_seed"])
         result = estimate_triply_IF(data["X"], data["M"], data["A"], data["Y"],
                                    tilde_p=config["tilde_p"], tilde_q=config["tilde_q"],
                                    factor_method=method, seed=task["training_seed"],
-                                   lambda_grid=grid, **_WORKER["training"])
+                                   lambda_grid=grid, **options)
         scores = np.asarray(result["crossfit_scores"], dtype=np.float64).reshape(-1)
         if len(scores) != task["n"] or not np.isfinite(scores).all():
             raise ValueError("Every input subject must have exactly one finite cross-fitted score")
@@ -575,10 +602,24 @@ def parse_args(argv=None):
                         help="Recycle worker processes to release CPU/CUDA allocations (default 1)")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--n", type=lambda s: [int(x) for x in s.split(",")], default=[100,300,800,1200,2000,3000])
-    parser.add_argument("--p", type=int, default=2000, help="Number of observed covariates (default 2000)")
-    parser.add_argument("--q", type=int, default=1000, help="Number of observed mediators (default 1000)")
+    parser.add_argument("--p", type=int, default=500, help="Number of observed covariates (default 500)")
+    parser.add_argument("--q", type=int, default=500, help="Number of observed mediators (default 500)")
     parser.add_argument("--loading-family", choices=("polynomial", "haar"), default="polynomial",
                         help="Fixed measurement maps: additive degree-3 polynomial (default), or explicit legacy Haar")
+    parser.add_argument("--alpha-upper", type=float, default=1.0,
+                        help="Treatment coefficient upper bound for Uniform(0, bound), default 1")
+    parser.add_argument("--delta1-spread", type=float, default=0.2,
+                        help="Scale independent Uniform(.5,1.5) delta draws about 1; default .2 gives [.9,1.1]")
+    parser.add_argument("--delta1-shift", type=float, default=0.0,
+                        help="Optional shift for delta_1; default 0")
+    parser.add_argument("--delta1-contrast", type=float, default=0.0,
+                        help="Explicit legacy contrast branch; default 0 keeps independent delta matrices")
+    parser.add_argument("--lambda-mode", choices=("fixed", "grid"), default="fixed",
+                        help="Prespecified weights (default) or separate held-out tuning in each representation half")
+    parser.add_argument("--lambda-fixed", type=lambda s: [float(x) for x in s.split(",")],
+                        default=[0.45, 0.45, 0.10], help="Fixed ME weight triple, default .45,.45,.10")
+    parser.add_argument("--lambda-fixed-zero", type=lambda s: [float(x) for x in s.split(",")],
+                        default=[0.5, 0.5, 0.0], help="Fixed zero-alignment weight triple, default .5,.5,0")
     parser.add_argument("--reps", type=int, default=200)
     parser.add_argument("--target-reps", type=int, default=None,
                         help="Run/report only this replication prefix; later raise it up to reserved --reps without changing run identity")
@@ -595,13 +636,24 @@ def parse_args(argv=None):
                         help="Import the exact saved mechanism from a bundle directory, prefix, JSON or NPZ; DGP settings and parameter seed must match")
     parser.add_argument("--weight-decay", type=float, default=0.0,
                         help="Shared Adam weight decay for representation, nuisance and tuning fits; recorded in scientific run identity (default 0)")
-    parser.add_argument("--seed-base", type=int, default=880000)
+    parser.add_argument("--seed-base", type=int, default=20261019)
     parser.add_argument("--pilot-epochs", type=int, default=None)
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--summarize-only", action="store_true")
     args = parser.parse_args(argv)
     try:
+        from mediencoder.simulation.dgp import DGPConfig
+        DGPConfig(p=args.p, q=args.q, alpha_upper=args.alpha_upper,
+                  delta1_spread=args.delta1_spread, delta1_shift=args.delta1_shift,
+                  delta1_contrast=args.delta1_contrast, loading_family=args.loading_family).validate()
         validate_weight_decay(args.weight_decay)
+        for name in ("lambda_fixed", "lambda_fixed_zero"):
+            value = getattr(args, name)
+            if (len(value) != 3 or not all(math.isfinite(x) and x >= 0 for x in value)
+                    or value[0] <= 0 or value[1] <= 0 or not math.isclose(sum(value), 1.0, abs_tol=1e-9)):
+                raise ValueError(f"--{name.replace('_', '-')} must contain three nonnegative weights summing to 1, with positive reconstruction weights")
+        if args.lambda_fixed[2] <= 0 or args.lambda_fixed_zero[2] != 0:
+            raise ValueError("--lambda-fixed requires positive alignment weight; --lambda-fixed-zero requires zero alignment weight")
     except ValueError as exc:
         parser.error(str(exc))
     if args.tasks_per_worker < 1:
@@ -652,7 +704,7 @@ def _main_locked(args):
     else:
         manifest.update(created_at=utc_now(), truth=mechanism.truth.to_dict(),
                         mechanism_provenance=mechanism_provenance,
-                        implementation_note="Paper/theory untouched. Fixed-mechanism population truth; raw MSE losses with simplex lambda weights; retained stop-gradient; dataset-specific within-fold IF intervals.")
+                        implementation_note="Paper/theory untouched. Fixed-mechanism population truth; raw reconstruction MSE; row-L2-normalized mediator alignment with stop-gradient; recorded fixed or tuned simplex lambda weights; dataset-specific within-fold IF intervals.")
         atomic_json(manifest_path, manifest)
     tasks = list(build_tasks(config))
     expected = {t["task_id"]: t for t in tasks}

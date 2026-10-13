@@ -1,5 +1,10 @@
 # Paired MediEncoder with a retained mechanism
 
+This optional workflow explicitly selects the legacy Haar dimensions and
+structural parameters instead of the current main defaults. Its training now
+uses row-L2-normalized alignment and 300/300 nuisance networks; it defines a
+new scientific run and does not reproduce or pool the archived raw-loss results.
+
 The manual **Paired MediEncoder on retained mechanism (weight decay 0)**
 workflow (`.github/workflows/regularization.yml`) uses weight decay `0.0` for
 every neural learner, matching the current training defaults. It fits
@@ -33,8 +38,8 @@ dependency on the previous run's expiring GitHub artifact.
 
 Zero weight decay applies to the representation networks, auxiliary outcome
 regressions used for tuning, and final nuisance regressions. Current coupled
-losses use raw MSE with simplex-constrained lambda weights and stop-gradient
-alignment. Each dataset's confidence interval uses its own cross-fitted scores
+reconstruction losses use raw MSE with simplex-constrained lambda weights.
+Alignment uses row-L2-normalized codes and a detached target. Each dataset's confidence interval uses its own cross-fitted scores
 and within-fold score variance. The manifest records effective training settings
 and scientific source hashes. A run using the current source requires a new
 run identity and output directory; it cannot resume historical checkpoints

@@ -86,7 +86,8 @@ environment settings. Prespecified changes use `--clip-eps`, `--pi2-soft`, or
 be selected together. Such truncation choices can affect bias and must be
 reported with the analysis; finite weights do not establish population overlap.
 
-The coupled losses use raw MSE, without variance normalization, and the three
+Reconstruction losses use raw MSE. Alignment compares row-L2-normalized mediator
+and predicted codes, with target stop-gradient and epsilon 1e-8. The three
 lambda weights sum to one. This does not alter the separate input-preprocessing
 option described above.
 Stop-gradient alignment and reconstruction-based checkpointing are retained;

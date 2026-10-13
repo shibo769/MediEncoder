@@ -35,7 +35,7 @@ def test_changing_loading_family_preserves_structural_draws_truth_and_latents(cu
                  "gamma_0", "gamma_1", "kappa_0", "kappa_1"):
         np.testing.assert_array_equal(cubic.arrays[name], haar.arrays[name])
     assert cubic.truth == haar.truth
-    assert cubic.config.delta1_contrast == haar.config.delta1_contrast == 2.0
+    assert cubic.config.delta1_contrast == haar.config.delta1_contrast == 0.0
     poly_data, haar_data = (dgp.sample_data(m, 21, 141) for m in (cubic, haar))
     for name in ("A", "Y"):
         np.testing.assert_array_equal(poly_data[name], haar_data[name])
@@ -62,7 +62,8 @@ def test_cubic_schema_roundtrip_records_family_and_detects_tampering(cubic, tmp_
     dgp.save_mechanism(cubic, prefix)
     loaded = dgp.load_mechanism(prefix)
     payload = json.loads(prefix.with_suffix(".json").read_text())
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
+    assert payload["config"]["alpha_upper"] == 1.0
     assert payload["config"]["loading_family"] == "polynomial"
     assert loaded.mechanism_hash == cubic.mechanism_hash
     for name in ("X", "M", "A", "Y"):
@@ -79,6 +80,8 @@ def test_schema_one_haar_artifact_preserves_original_hash_and_sampling(tmp_path)
     payload = json.loads(prefix.with_suffix(".json").read_text())
     old = dgp.load_mechanism(prefix)
     assert old.schema_version == 1 and old.config.loading_family == "haar"
+    assert old.config.alpha_upper == 2.0
+    assert old.config.delta1_spread == 1.0 and old.config.delta1_contrast == 2.0
     assert old.mechanism_hash == payload["mechanism_hash"]
     data = dgp.sample_data(old, 7, 444)
     a, c = old.arrays, old.config
@@ -109,9 +112,11 @@ def test_cli_default_and_explicit_legacy_import_are_unambiguous(tmp_path, monkey
     monkeypatch.setattr(runner, "training_configuration", lambda *args: {})
     default = runner.make_config(runner.parse_args(["--output-dir", str(tmp_path)]))
     legacy = runner.make_config(runner.parse_args(["--output-dir", str(tmp_path),
-                                                  "--loading-family", "haar"]))
+                                                  "--loading-family", "haar", "--p", "2000",
+                                                  "--q", "1000", "--alpha-upper", "2",
+                                                  "--delta1-spread", "1", "--delta1-contrast", "2"]))
     assert default["dgp"]["loading_family"] == "polynomial"
-    assert default["loss_normalization"] == "none"
+    assert default["loss_normalization"] == "alignment_row_l2"
     source = Path(__file__).parents[1] / "experiments/mechanisms/wavelet_seed910000"
     with pytest.raises(ValueError, match="DGP configuration differs"):
         runner.prepare_mechanism(tmp_path, default, mechanism_from=source)
@@ -119,6 +124,36 @@ def test_cli_default_and_explicit_legacy_import_are_unambiguous(tmp_path, monkey
     imported, _ = runner.prepare_mechanism(tmp_path, legacy, mechanism_from=source)
     assert imported.config.loading_family == "haar"
     assert asdict(imported.config) == legacy["dgp"]
+
+
+def test_default_structural_parameters_use_narrow_independent_delta_draws(cubic):
+    assert (dgp.DGPConfig().p, dgp.DGPConfig().q) == (500, 500)
+    assert cubic.config.alpha_upper == 1.0
+    assert np.all((cubic.arrays["alpha"] >= 0) & (cubic.arrays["alpha"] <= 1))
+    for name in ("delta_0", "delta_1"):
+        assert np.all((cubic.arrays[name] >= .9) & (cubic.arrays[name] <= 1.1))
+    assert not np.array_equal(cubic.arrays["delta_0"], cubic.arrays["delta_1"])
+    assert cubic.metadata["delta_distribution"]["base_family"] == "independent_uniform"
+    eigenvalues = np.linalg.eigvalsh(cubic.arrays["Sigma_U"])
+    assert np.all((eigenvalues >= .05) & (eigenvalues <= .10))
+
+
+def test_schema_two_roundtrip_preserves_legacy_config_arrays_and_hash(cubic, tmp_path):
+    legacy = dgp.draw_parameters(replace(cubic.config, alpha_upper=2.0,
+                                         delta1_spread=1.0, delta1_contrast=2.0), 1234)
+    legacy = replace(legacy, schema_version=2)
+    expected_hash = legacy.mechanism_hash
+    prefix = tmp_path / "schema-two"
+    dgp.save_mechanism(legacy, prefix)
+    payload = json.loads(prefix.with_suffix(".json").read_text())
+    assert payload["schema_version"] == 2 and "alpha_upper" not in payload["config"]
+    loaded = dgp.load_mechanism(prefix)
+    assert asdict(loaded.config) == asdict(legacy.config)
+    assert loaded.mechanism_hash == expected_hash
+    for name, value in legacy.arrays.items():
+        np.testing.assert_array_equal(loaded.arrays[name], value)
+    dgp.save_mechanism(loaded, tmp_path / "copy-two")
+    assert dgp.load_mechanism(tmp_path / "copy-two").mechanism_hash == expected_hash
 
 
 def test_invalid_loading_family_is_rejected():

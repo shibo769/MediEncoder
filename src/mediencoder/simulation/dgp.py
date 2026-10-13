@@ -1,9 +1,9 @@
 """Fixed-mechanism main simulation with additive cubic measurement loadings.
 
 New mechanisms use powers one through three with independent fixed Gaussian
-coefficients. Structural equations, parameter distributions and population truth
-are unchanged by this measurement-map choice. Haar loadings remain an explicit
-legacy option; schema-1 artifacts retain their original family and content hash.
+coefficients, alpha in [0, 1], and independently drawn delta matrices in
+[0.9, 1.1]. Haar loadings remain an explicit legacy option; schema-1 and schema-2
+artifacts retain their original family, numerical arrays, and content hash.
 No estimation observations are used to draw either loading family.
 
 The population target is E[Y(1,M(0))].  All polynomial moments are analytic; only
@@ -23,15 +23,15 @@ import numpy as np
 from scipy.special import expit
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SUPPORT_RULE = "independent-fixed-latent-pilot-minmax"
 LOADING_FAMILIES = ("polynomial", "haar")
 
 
 @dataclass(frozen=True)
 class DGPConfig:
-    p: int = 2000
-    q: int = 1000
+    p: int = 500
+    q: int = 500
     bar_p: int = 5
     bar_q: int = 5
     mu: float = 0.0
@@ -39,9 +39,10 @@ class DGPConfig:
     sigma_eps_M: float = 1.0
     sigma_y: float = 1.0
     sigma_U_scale: float = 0.05
+    alpha_upper: float = 1.0
     delta1_shift: float = 0.0
-    delta1_spread: float = 1.0
-    delta1_contrast: float = 2.0
+    delta1_spread: float = 0.2
+    delta1_contrast: float = 0.0
     L: int = 5
     r_min: int = 1
     r_max: int = 3
@@ -63,15 +64,17 @@ class DGPConfig:
             raise ValueError("This main-simulation quadrature implementation supports at most 5 latent dimensions")
         if not isinstance(self.r_min, int) or not isinstance(self.r_max, int) or self.r_min > self.r_max:
             raise ValueError("r_min and r_max must be ordered integers")
-        for name in ("mu", "sigma_eps_X", "sigma_eps_M", "sigma_y", "sigma_U_scale",
+        for name in ("mu", "sigma_eps_X", "sigma_eps_M", "sigma_y", "sigma_U_scale", "alpha_upper",
                      "delta1_shift", "delta1_spread", "delta1_contrast", "coef_scale_X", "coef_scale_M"):
             if not np.isfinite(getattr(self, name)):
                 raise ValueError(f"{name} must be finite")
-        for name in ("sigma_eps_X", "sigma_eps_M", "sigma_y", "coef_scale_X", "coef_scale_M"):
+        for name in ("sigma_eps_X", "sigma_eps_M", "sigma_y", "delta1_spread", "coef_scale_X", "coef_scale_M"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be nonnegative")
         if self.sigma_U_scale <= 0:
             raise ValueError("sigma_U_scale must be positive")
+        if self.alpha_upper <= 0:
+            raise ValueError("alpha_upper must be positive")
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,10 @@ class Mechanism:
 
     def serialized_config(self) -> dict[str, Any]:
         config = asdict(self.config)
+        if self.schema_version < 3:
+            # Alpha's upper bound was implicit before schema 3. Do not alter
+            # the payload used by existing numerical-mechanism hashes.
+            config.pop("alpha_upper")
         if self.schema_version == 1:
             # Schema 1 predates the family field. Keep its exact hashed payload.
             config.pop("loading_family")
@@ -195,7 +202,7 @@ def draw_parameters(config: DGPConfig | dict[str, Any] | None = None,
     structural_seed, pilot_seed, loading_seed = _stream_seeds(parameter_seed, 0x50415241, 3)
     rng = np.random.default_rng(structural_seed)
     d = c.bar_p
-    arrays = {"alpha": rng.uniform(0, 2, size=d)}
+    arrays = {"alpha": rng.uniform(0, c.alpha_upper, size=d)}
     delta_0 = rng.uniform(0.5, 1.5, size=(d, d))
     delta_1 = rng.uniform(0.5, 1.5, size=(d, d))
     delta_0 = 1 + c.delta1_spread * (delta_0 - 1)
@@ -212,6 +219,11 @@ def draw_parameters(config: DGPConfig | dict[str, Any] | None = None,
         arrays[name] = rng.uniform(0.5, 1.5, size=d)
     metadata = {"loading_family": c.loading_family,
                 "structural_seed": structural_seed, "loading_seed": loading_seed,
+                "alpha_distribution": {"family": "uniform", "low": 0.0, "high": c.alpha_upper},
+                "delta_distribution": {"base_family": "independent_uniform", "base_low": 0.5,
+                                       "base_high": 1.5, "spread": c.delta1_spread,
+                                       "delta1_shift": c.delta1_shift,
+                                       "delta1_contrast": c.delta1_contrast},
                 "generator": "numpy.PCG64", "numpy_version_at_creation": np.__version__,
                 "design_note": "Fixed independent parameter and loading streams; no estimation-data calibration."}
     if c.loading_family == "polynomial":
@@ -379,11 +391,19 @@ def load_mechanism(path_prefix: str | Path) -> Mechanism:
     json_path, npz_path = _artifact_paths(path_prefix)
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     schema_version = payload.get("schema_version")
-    if schema_version not in (1, SCHEMA_VERSION):
+    if schema_version not in (1, 2, SCHEMA_VERSION):
         raise ValueError("Unsupported mechanism artifact schema")
     if payload.get("arrays_file") != npz_path.name:
         raise ValueError("Mechanism JSON/NPZ file names do not match")
     config_data = dict(payload["config"])
+    if schema_version < 3:
+        if "alpha_upper" in config_data:
+            raise ValueError("Schema-1/2 artifacts cannot contain an alpha_upper field")
+        # Preserve the original scientific configuration; arrays are loaded,
+        # never redrawn using the new defaults.
+        config_data["alpha_upper"] = 2.0
+    elif "alpha_upper" not in config_data:
+        raise ValueError("Schema-3 artifacts must specify alpha_upper")
     if schema_version == 1:
         if "loading_family" in config_data:
             raise ValueError("Schema-1 artifacts cannot contain a loading_family field")
@@ -393,7 +413,7 @@ def load_mechanism(path_prefix: str | Path) -> Mechanism:
             raise ValueError(f"Unsupported legacy measurement family: {legacy_family}")
         config_data["loading_family"] = families[legacy_family]
     elif "loading_family" not in config_data:
-        raise ValueError("Schema-2 artifacts must specify loading_family")
+        raise ValueError("Schema-2/3 artifacts must specify loading_family")
     config = DGPConfig(**config_data)
     config.validate()
     with np.load(npz_path, allow_pickle=False) as archive:

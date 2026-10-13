@@ -52,7 +52,7 @@ class CorrectedRunnerTests(unittest.TestCase):
             self.assertEqual((config["dgp"]["p"], config["dgp"]["q"]), (1000, 1000))
             self.assertEqual(len(list(runner.build_tasks(config))), 200)
             default = runner.make_config(runner.parse_args(["--output-dir", "unused"]))
-            self.assertEqual((default["dgp"]["p"], default["dgp"]["q"]), (2000, 1000))
+            self.assertEqual((default["dgp"]["p"], default["dgp"]["q"]), (500, 500))
             for option in ("--p", "--q"):
                 with self.assertRaises(SystemExit):
                     runner.parse_args(["--output-dir", "unused", option, "0"])
@@ -184,8 +184,8 @@ class CorrectedRunnerTests(unittest.TestCase):
             args = runner.parse_args(["--output-dir", "unused", "--pilot-epochs", "2"])
             pilot = runner.make_config(args)
             self.assertEqual(pilot["run_kind"], "PILOT_NOT_FOR_PAPER")
-            self.assertEqual(len(pilot["lambda_grid"]), 36)
-            self.assertEqual(len(pilot["lambda_grid_zero"]), 9)
+            self.assertEqual(pilot["lambda_grid"], [[.45, .45, .10]])
+            self.assertEqual(pilot["lambda_grid_zero"], [[.5, .5, 0.]])
             runtime = runner.runtime_training_configuration(pilot["training"])
             for name in ("nn_cfg", "ae_cfg", "me_cfg"):
                 self.assertEqual(pilot["training"][name]["epochs"], 2)

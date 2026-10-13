@@ -18,14 +18,16 @@ and [Actions limits](https://docs.github.com/en/actions/reference/limits).
 The preparation job creates the mechanism **once**, from parameter seed 910000,
 and saves a common manifest, `mechanism.json`, and `mechanism.npz`. Every shard
 downloads these exact files. The scientific manifest reserves 200 replications,
-but the execution target is 50. Both lambda grids (36 positive-alignment and 9
-zero-alignment candidates), the 300-epoch cap, dimensions, noise parameters,
-data seeds, and training seeds are unchanged.
+but the execution target is 50. The current defaults are p=q=500, fixed ME weights (.45,.45,.10), ablation
+weights (.5,.5,0), independent delta entries Uniform(.9,1.1), alpha Uniform(0,1),
+row-L2-normalized alignment, and two-layer 300/300 nuisance networks.
+The 300-epoch cap and noise parameters are shared with the local/SCC code.
+The seed base is 20261019; the mechanism seed is 910000.
 
 There are 50 shards. Shard `i` computes replication indices congruent to `i`
 modulo 50, covering all six sample sizes and all five arms. For the initial
 target of 50, each shard has 30 fits. Together they contain exactly 1,500 fits.
-Both tables reuse the same tuned MediEncoder fit. Each runner uses two workers,
+Both tables reuse the same MediEncoder fit. Each runner uses two workers,
 one CPU thread per worker, and a fresh worker process after every fit.
 
 Python 3.12.13, the CPU-only PyTorch 2.8.0 wheel, and the dependency versions in
@@ -37,7 +39,7 @@ this workflow.
 
 ## Canary, limits, and incomplete jobs
 
-Before launching the matrix, one separate canary runs a full-grid, full-epoch
+Before launching the matrix, one separate canary runs a fixed-lambda, full-epoch
 MediEncoder fit at n=100. Its manifest is marked `BENCHMARK_NOT_FOR_PAPER`; its
 result is not included in the formal 50 replications. Failure or a 25-minute
 canary timeout prevents the matrix from starting. A single timing measurement

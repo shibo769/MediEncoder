@@ -46,10 +46,18 @@ the ordinary package dependencies. Other version combinations are not certified.
 New main runs use fixed additive polynomial measurement maps of degree 3:
 `phi_k(f) = sum_j sum_{r=1}^3 C[k,j,r-1] * f[j]^r`, with independent Gaussian
 coefficients of variance `coef_scale^2 / 3`. X and M use separate loading streams.
-The treatment, latent mediator, outcome, structural-coefficient defaults and
-population-target calculation are unchanged. This loading-only update is not a
-reproduction of the earlier independently sampled-delta B20 experiment and does
-not modify loss normalization, lambda tuning, or archived results.
+Current main defaults use p=q=500, five true factors per block, and ten learned
+coordinates per block. Treatment coefficients are fixed draws from Uniform(0,1);
+delta_0 and delta_1 are independent fixed draws with entries Uniform(0.9,1.1).
+Gaussian mediator innovations, outcome equations, and noise SDs X=2, M=1, Y=1
+are retained. This creates a new mechanism and does not resume historical results.
+
+MediEncoder defaults to fixed weights (.45,.45,.10), with ablation weights
+(.5,.5,0). Explicit --lambda-mode grid retains the former 36/9 candidate searches.
+The alignment term compares each mediator code and predicted code after dividing
+each row by its own L2 norm, with epsilon 1e-8. The target remains detached.
+X/M reconstruction uses raw MSE; inference still uses the original encoder
+outputs. All nuisance networks have two hidden layers of width 300.
 
 Use `--loading-family haar` explicitly for a new run with the retained Haar
 generator or when importing an old Haar mechanism. Schema-1 saved mechanisms
@@ -97,9 +105,9 @@ explicitly imports the historical Haar mechanism; the main simulation runner
 defaults to cubic polynomial loadings.
 
 Defaults are six sample sizes (100, 300, 800, 1200, 2000, 3000), 200 replications,
-and five arms: Projection, Autoencoder, VAE, tuned MediEncoder, and MediEncoder
+and five arms: Projection, Autoencoder, VAE, fixed-lambda MediEncoder, and MediEncoder
 with zero alignment weight. This is 6,000 fits, each potentially containing many
-neural-network training runs. Both tables share the same tuned MediEncoder fits.
+neural-network training runs. Both tables share the same MediEncoder fits.
 One worker is the conservative default. Workers are recycled between fits to
 release allocations; increase concurrency only after checking resources.
 
@@ -144,7 +152,7 @@ They remain asymptotic intervals and depend on identification, overlap,
 representation, and nuisance-estimation assumptions. Passing software tests does
 not establish these assumptions or guarantee nominal coverage.
 
-The mediator alignment target intentionally uses stop-gradient; checkpoint
+The mediator alignment target intentionally uses stop-gradient and row-L2 normalization; checkpoint
 selection uses reconstruction loss. The implementation is not asserted to solve
 an unconstrained joint scalar-objective argmin. These corrections do not revise
 or certify any manuscript proof. Historical tables must be recomputed; this code

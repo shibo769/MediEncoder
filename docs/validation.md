@@ -1,5 +1,21 @@
 # Validation of the corrected release
 
+## October 13, 2026 synchronized experiment configuration
+
+The main defaults now use p=q=500, alpha Uniform(0,1), independent delta_0/delta_1
+entries Uniform(0.9,1.1), and fixed ME weights (.45,.45,.10) / ablation (.5,.5,0).
+Nuisance networks have two hidden layers (300,300). The alignment loss compares
+per-observation row-L2-normalized mediator and predicted codes with epsilon 1e-8
+and a detached target. Reconstruction stays in raw MSE units.
+
+All 222 tests passed in 79.55 seconds on Python 3.11.11, PyTorch 2.7.0 CPU,
+NumPy 2.2.5, and pytest 7.4.0. Checks include independent positive rescaling,
+zero/near-zero rows, gradient routing, actual tiny MediEncoder/MediVAE and
+fixed-weight estimator fits, skipping candidate selection, the smaller nuisance
+architecture, DGP ranges, and legacy mechanism hash compatibility. These fits
+are software checks; no formal simulation was launched. GPU runtime validation
+and inferential performance of the directional alignment remain separate.
+
 ## October 6, 2026 code audit
 
 The previously agreed within-fold variance estimator is now implemented in

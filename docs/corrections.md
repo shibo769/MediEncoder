@@ -22,13 +22,15 @@ failures. Monte Carlo precision is separate from estimator uncertainty.
 
 ## Simulated truth and training data
 
+The current main defaults use p=q=500, alpha entries Uniform(0,1), and independent
+delta_0/delta_1 entries Uniform(0.9,1.1), with no contrast perturbation.
 The main experiment draws a mechanism once using parameter seed 910000, saves it,
 and samples independent datasets conditional on that mechanism. Structural and
 measurement coefficients do not change with sample size or repeat. New runs use
 additive polynomial loadings of degree 3, with independent Gaussian coefficients
-of variance `coef_scale^2 / 3` for each block. The loading-only default change
-preserves treatment/outcome equations and structural-coefficient defaults;
-it does not reproduce the earlier independent-delta B20 design.
+of variance `coef_scale^2 / 3` for each block. The current default also uses the narrow independent delta and alpha ranges
+specified above. Existing numerical mechanisms remain loadable with their
+original arrays; the current defaults do not reconstruct the old frozen run.
 Explicit legacy Haar runs use an independent 4,096-row latent pilot to fix atom
 support, removing the old dependence on the estimation sample. Saved mechanisms
 retain their original family and content hash; new polynomial runs reject an
@@ -40,8 +42,13 @@ conditional outcome is not substituted for the population target. Oracle values
 remain in simulation metadata and are excluded from fitting and tuning.
 
 The coupled loss is `lambda1 * MSE_X + lambda2 * MSE_M + lambda3 * MSE_align`.
-Training and validation use raw MSE without dividing by observed or latent
-variances. MSE retains its mean over subjects and coordinates; the nonnegative
+Reconstruction uses raw MSE. The alignment term compares the detached mediator
+code and its prediction after each row is divided by its own L2 norm, bounded
+below by 1e-8. Positive rescaling of either nonzero row leaves this directional
+loss unchanged when its norm is above the epsilon threshold. It no longer
+penalizes discrepancies in code magnitude. Only the alignment loss uses these
+normalized codes; reconstruction and nuisance estimation retain the original
+encoder outputs. MSE retains its mean over subjects and coordinates; the nonnegative
 lambda weights sum to one, with positive reconstruction weights. Optional input
 standardization is a separate preprocessing setting fitted on representation-
 training rows; outcome units are preserved.
@@ -64,10 +71,12 @@ Checkpoint selection uses the weighted reconstruction criterion. The code does
 not identify this procedure with solving an unconstrained joint scalar objective,
 nor establish a representation recovery rate.
 
-The main rerun preserves the historical training settings: 300 maximum epochs,
-encoder widths 300/200, cross-factor widths 50/50, nuisance widths 300/300/300,
-zero weight decay, and VAE KL weight 0.5. Tuning evaluates 36 strictly positive
-alignment-weight candidates; the ablation evaluates nine zero-alignment candidates.
+The main defaults use 300 maximum epochs,
+encoder widths 300/200, cross-factor widths 50/50, nuisance widths 300/300,
+zero weight decay, and VAE KL weight 0.5. Main defaults fix lambda to
+(.45,.45,.10), with ablation weights (.5,.5,0), and skip candidate selection.
+The explicit grid option evaluates 36 positive-alignment candidates and nine
+zero-alignment candidates.
 These choices are recorded rather than silently reconciled with manuscript text.
 
 In the retained historical Haar design, the fixed seed's atoms have limited support: only one of five overlaps the
@@ -77,6 +86,6 @@ latent identifiability. Simulation results do not verify representation assumpti
 The new cubic maps also do not by themselves prove that learned representations
 recover the latent factors or that the auxiliary propensity has uniform overlap.
 
-Corrections change the population target and normalization, so old estimates are
+Scientific configuration and normalization changes define a new experiment, so old estimates are
 not pooled into new results. Unfavorable rankings or coverage are not grounds for
 changing seeds or omitting tasks. The manuscript and proofs need separate review.

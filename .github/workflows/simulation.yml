@@ -71,7 +71,7 @@ jobs:
           python -m mediencoder.simulation.runner --output-dir prepared-artifact
           --reps 200 --target-reps "$TARGET_REPS" --device cpu --workers 2
           --summarize-only
-      - name: Measure one full-grid, full-epoch n100 MediEncoder fit
+      - name: Measure one fixed-lambda, full-epoch n100 MediEncoder fit
         run: >-
           timeout --signal=INT --kill-after=30s 25m
           python -m mediencoder.simulation.runner --output-dir canary-run

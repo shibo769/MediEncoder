@@ -6,9 +6,9 @@
 #   * Estimation: Algorithm 1, cross-fitted over four folds. estimate_triply_IF
 #     is the only entry point; the single-split path (0.4 / 0.2 / 0.4, no
 #     cross-fitting) is deleted.
-#   * lambda: always selected, never fixed, by Algorithm 2 on each
-#     representation half's own (I_tr, I_val). A lambda-bearing method called
-#     without a grid is an error, not a fixed-lambda run.
+#   * lambda: either explicitly prespecified with fixed_lambda, or selected by
+#     Algorithm 2 on each representation half's own (I_tr, I_val). Missing or
+#     ambiguous lambda policies are rejected before any fit.
 #   * Selection score: held-out prediction error on the TREATED, and only that
 #     -- see _check_selection_rule().
 # ============================================================
@@ -25,6 +25,7 @@ from scipy.stats import norm
 
 from mediencoder.models import (
     train_nuisance_nn,
+    DEFAULT_NUISANCE_HIDDEN,
     predict_nn,
     train_autoencoder,
     encode_with_autoencoder
@@ -36,6 +37,8 @@ from mediencoder.training import (
     train_mediencoder_vae,
     encode_with_mediencoder_vae,
     validate_lambdas_unbalanced,
+    ALIGNMENT_NORMALIZATION,
+    ALIGNMENT_NORM_EPS,
 )
 
 import random
@@ -503,6 +506,7 @@ SHARED_TRAIN_CFG = dict(
 # per branch.
 SHARED_HIDDEN = (300, 200)   # paper Sec 5.1: encoders use widths 300 and 200
 SHARED_ADAM_EPS = 1e-8
+SHARED_NUISANCE_HIDDEN = DEFAULT_NUISANCE_HIDDEN
 
 
 def _shared_cfg(**overrides):
@@ -1256,6 +1260,7 @@ def estimate_triply_IF(
     encode_cfg=None,
     seed=42,
     lambda_grid=None,
+    fixed_lambda=None,
     return_effects=False,
     preprocessing="none",
     numerical_safeguards=None,
@@ -1276,8 +1281,10 @@ def estimate_triply_IF(
     four times, which is what "reuse_rep" refers to.
 
     lambda_grid (Algorithm 1, step 4): when given, lambda is selected SEPARATELY
-    for each representation half from its own (I_tr, I_val) via Algorithm 2. Pass
-    None for methods that have no lambda (projection, autoencoder, vae).
+    for each representation half from its own (I_tr, I_val) via Algorithm 2.
+    Alternatively, fixed_lambda explicitly prespecifies one valid three-weight
+    tuple and skips candidate fitting and outcome-based selection. Supply exactly
+    one policy for MediEncoder/MediVAE and neither for other methods.
     """
     X, M, A, Y = map(np.asarray, (X, M, A, Y))
     if X.ndim != 2 or M.ndim != 2 or A.ndim != 1 or Y.ndim != 1:
@@ -1299,11 +1306,20 @@ def estimate_triply_IF(
         raise ValueError("Treatment A must be binary")
     factor_method = factor_method.lower()
     if factor_method in _LAMBDA_METHODS:
-        if lambda_grid is None:
-            raise ValueError("MediEncoder/MediVAE requires a tuning grid")
-        _check_lambda_grid_wellposed(lambda_grid)
-    elif lambda_grid is not None:
-        raise ValueError("This representation method does not use a lambda grid")
+        if fixed_lambda is not None:
+            if lambda_grid is not None:
+                raise ValueError("Supply exactly one of fixed_lambda or lambda_grid")
+            _check_lambda_grid_wellposed([fixed_lambda])
+            fixed_lambda = tuple(float(weight) for weight in fixed_lambda)
+            me_cfg = dict({} if me_cfg is None else me_cfg)
+            me_cfg["lambda1"], me_cfg["lambda2"], me_cfg["lambda3"] = fixed_lambda
+            me_cfg["allow_unbalanced_lambda"] = True
+        elif lambda_grid is None:
+            raise ValueError("MediEncoder/MediVAE requires a tuning grid or explicit fixed_lambda")
+        else:
+            _check_lambda_grid_wellposed(lambda_grid)
+    elif lambda_grid is not None or fixed_lambda is not None:
+        raise ValueError("This representation method does not use lambda weights")
     I1, I2, I3, I4 = _split_indices_4fold(n, seed=seed + 999)
     fold_indices = [
         dict(representation_train=I1, representation_validation=I2, nuisance=I3, estimation=I4),
@@ -1506,7 +1522,11 @@ def estimate_triply_IF(
         "estimator_contract": {
             "observed_data_only": True,
             "alignment_stop_gradient": True if factor_method in _LAMBDA_METHODS else None,
-            "coupled_loss_scales": "none" if factor_method in _LAMBDA_METHODS else None,
+            "coupled_loss_scales": "alignment_row_l2" if factor_method in _LAMBDA_METHODS else None,
+            "reconstruction_loss_normalization": "none" if factor_method in _LAMBDA_METHODS else None,
+            "alignment_normalization": ALIGNMENT_NORMALIZATION if factor_method in _LAMBDA_METHODS else None,
+            "alignment_norm_eps": ALIGNMENT_NORM_EPS if factor_method in _LAMBDA_METHODS else None,
+            "lambda_policy": ("fixed" if fixed_lambda is not None else "held_out_prediction") if factor_method in _LAMBDA_METHODS else None,
             "coupled_loss_reduction": "mean_over_subjects_and_coordinates" if factor_method in _LAMBDA_METHODS else None,
             "scores": "uncentered_crossfit_scores_in_original_subject_order",
             "standard_error": "sqrt(sum_k(n_k * var(scores_in_fold_k, ddof=1))/n^2)",
@@ -1519,6 +1539,10 @@ def estimate_triply_IF(
         # halves by _merge_rep_fit_info), surfaced so the driver can record which
         # KL weight the TUNED VAE actually chose in each replicate.
         out["selected_beta_kl"] = rep_fit_info["selected_beta_kl"]
+    if fixed_lambda is not None:
+        out["selected_lambda1"], out["selected_lambda2"], out["selected_lambda3"] = fixed_lambda
+        out["selected_lambda_A"] = fixed_lambda
+        out["selected_lambda_B"] = fixed_lambda
     if tuning:
         # Per-half selections. There is no single "the" lambda under Algorithm 1;
         # selected_lambda* below is half A's, reported so the existing table

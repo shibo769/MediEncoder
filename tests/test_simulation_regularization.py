@@ -42,6 +42,7 @@ def test_regularization_reaches_shared_configs_and_survives_worker_reset():
     try:
         args = runner.parse_args(["--output-dir", "unused", "--weight-decay", ".01",
                                   "--reps", "200", "--target-reps", "100",
+                                  "--lambda-mode", "grid",
                                   "--arms", "mediencoder,mediencoder_l3zero"])
         config = runner.make_config(args)
         assert config["B_requested"] == 200

@@ -122,7 +122,7 @@ def main(argv=None):
     _write_json(args.output / "manifest.json", manifest)
     try:
         from . import analyze
-        from mediencoder.estimation import _shared_cfg, SHARED_ADAM_EPS, _resolve_numerical_safeguards
+        from mediencoder.estimation import _shared_cfg, SHARED_ADAM_EPS, SHARED_NUISANCE_HIDDEN, _resolve_numerical_safeguards
         from mediencoder.training import generate_lambda_grid
         import torch
 
@@ -144,7 +144,7 @@ def main(argv=None):
         config = {} if args.config is None else json.loads(args.config.read_text(encoding="utf-8"))
         if not isinstance(config, dict) or set(config) - {"nn_cfg", "ae_cfg", "me_cfg", "encode_cfg"}:
             raise ValueError("Config accepts only nn_cfg, ae_cfg, me_cfg, encode_cfg")
-        config.setdefault("nn_cfg", _shared_cfg(eps=SHARED_ADAM_EPS, hidden_dims=(300, 300, 300)))
+        config.setdefault("nn_cfg", _shared_cfg(eps=SHARED_ADAM_EPS, hidden_dims=SHARED_NUISANCE_HIDDEN))
         grid = None
         if args.method == "mediencoder":
             grid = [v for v in generate_lambda_grid(step=args.grid_step, require_order=False) if v[2] > 1e-6]
