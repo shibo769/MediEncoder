@@ -89,7 +89,7 @@ def test_simulation_worker_checks_fold_variance_and_saves_failure(monkeypatch, t
     data = dict(X=np.zeros((8, 2)), M=np.zeros((8, 2)), A=np.arange(8) % 2,
                 Y=np.arange(8.), oracle={"forbidden": "latent information"})
     mechanism = SimpleNamespace(mechanism_hash="fixture", truth=SimpleNamespace(value=mean))
-    config = dict(tilde_p=1, tilde_q=1)
+    config = dict(tilde_p=1, tilde_q=1, dgp=dict(p=2, q=2))
     monkeypatch.setattr(runner, "_WORKER", dict(config=config, output_dir=tmp_path,
                                                mechanism=mechanism, run_hash="fixture", training={}))
     monkeypatch.setattr(dgp, "sample_data", lambda *args: data.copy())

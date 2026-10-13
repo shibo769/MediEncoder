@@ -474,7 +474,7 @@ def validate_checkpoint(record, manifest, output_dir):
         raise ValueError(f"Unsupported checkpoint status: {record.get('status')}")
 
 
-def _worker_init(config, output_dir, mechanism_prefix, run_hash):
+def _worker_init(config, output_dir, mechanism_prefix, run_hash, observed_data_from=None):
     configure_environment(config["device"])
     import torch
     torch.set_num_threads(1)
@@ -487,7 +487,8 @@ def _worker_init(config, output_dir, mechanism_prefix, run_hash):
     from mediencoder.simulation.dgp import load_mechanism
     _WORKER.update(config=config, output_dir=Path(output_dir),
                    mechanism=load_mechanism(mechanism_prefix), run_hash=run_hash,
-                   training=runtime_training_configuration(config["training"]))
+                   training=runtime_training_configuration(config["training"]),
+                   observed_data_from=None if observed_data_from is None else Path(observed_data_from))
 
 
 def observed_data_hash(data):
@@ -498,6 +499,154 @@ def observed_data_hash(data):
         h.update(name.encode()); h.update(str(a.shape).encode()); h.update(a.dtype.str.encode())
         h.update(a.tobytes())
     return h.hexdigest()
+
+
+def observed_dataset_identity(mechanism, task, config):
+    """Raw inputs are shared across training settings and CPU/GPU execution."""
+    dgp = config["dgp"]
+    return dict(schema_version=1, mechanism_hash=mechanism.mechanism_hash,
+                n=int(task["n"]), rep=int(task["rep"]), data_seed=int(task["data_seed"]),
+                p=int(dgp["p"]), q=int(dgp["q"]),
+                dgp_source_sha256=file_hash(ROOT / "simulation/dgp.py"))
+
+
+def observed_dataset_paths(directory, identity):
+    stem = (f"n{identity['n']:05d}_r{identity['rep']:04d}_"
+            + digest(identity))
+    directory = Path(directory)
+    return directory / (stem + ".npz"), directory / (stem + ".json"), directory / (stem + ".pending.json")
+
+
+def validate_observed_arrays(data, identity):
+    import numpy as np
+    if set(data) != {"X", "M", "A", "Y"}:
+        raise ValueError("Observed dataset must contain only X, M, A, Y")
+    shapes = {"X": (identity["n"], identity["p"]), "M": (identity["n"], identity["q"]),
+              "A": (identity["n"],), "Y": (identity["n"],)}
+    for name, shape in shapes.items():
+        array = data[name]
+        if (array.shape != shape or not np.issubdtype(array.dtype, np.number)
+                or np.issubdtype(array.dtype, np.complexfloating) or not np.isfinite(array).all()):
+            raise ValueError(f"Invalid observed dataset array: {name}")
+    if not np.isin(data["A"], (0, 1)).all():
+        raise ValueError("Observed treatment must be binary")
+
+
+def _read_observed_npz(path, identity):
+    import numpy as np
+    with np.load(path, allow_pickle=False) as saved:
+        data = {name: np.ascontiguousarray(saved[name]) for name in saved.files}
+    validate_observed_arrays(data, identity)
+    return data
+
+
+def read_observed_dataset(directory, identity):
+    npz, receipt, _ = observed_dataset_paths(directory, identity)
+    if not receipt.is_file() or not npz.is_file():
+        raise ValueError(f"Observed dataset cache is missing or incomplete: {receipt}")
+    metadata = json.loads(receipt.read_text(encoding="utf-8"))
+    if (metadata.get("identity") != identity or metadata.get("npz_file") != npz.name
+            or metadata.get("npz_sha256") != file_hash(npz)):
+        raise ValueError(f"Observed dataset identity/checksum mismatch: {receipt}")
+    data = _read_observed_npz(npz, identity)
+    array_metadata = {name: dict(shape=list(array.shape), dtype=array.dtype.str)
+                      for name, array in data.items()}
+    if (metadata.get("arrays") != array_metadata
+            or metadata.get("observed_data_sha256") != observed_data_hash(data)):
+        raise ValueError(f"Observed dataset array metadata/hash mismatch: {receipt}")
+    return data
+
+
+def _pair_has_returned_fit(output_dir, identity):
+    pattern = f"n{identity['n']:05d}_r{identity['rep']:04d}_*.json"
+    for path in (Path(output_dir) / "tasks").glob(pattern):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if all(record.get(key) == identity[key] for key in ("n", "rep", "data_seed")):
+            return True
+    return False
+
+
+def bind_observed_dataset(output_dir, identity, data):
+    """A run may never switch an already selected pair to different bytes."""
+    from filelock import FileLock
+    binding = Path(output_dir) / "dataset_bindings" / (digest(identity) + ".json")
+    expected = dict(identity=identity, observed_data_sha256=observed_data_hash(data))
+    def check():
+        if json.loads(binding.read_text(encoding="utf-8")) != expected:
+            raise ValueError("Observed dataset differs from this run's immutable pair binding")
+    if binding.exists():
+        check()
+        return data
+    binding.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(binding) + ".lock", timeout=600):
+        if binding.exists():
+            check()
+        else:
+            # Also protect resumed runs whose earlier records predate a binding,
+            # or whose binding was removed while task/score artifacts survived.
+            pattern = f"n{identity['n']:05d}_r{identity['rep']:04d}_*.json"
+            for path in (Path(output_dir) / "tasks").glob(pattern):
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if (all(record.get(key) == identity[key] for key in ("n", "rep", "data_seed"))
+                        and record.get("observed_data_sha256") is not None
+                        and record["observed_data_sha256"] != expected["observed_data_sha256"]):
+                    raise ValueError("Observed dataset differs from a previously returned fit for this pair")
+            atomic_json(binding, expected)
+    return data
+
+
+def cached_observed_data(mechanism, task, config, output_dir, observed_data_from=None):
+    """Produce a paired dataset once and load immutable bytes in every arm.
+
+    Final receipts and NPZ files are never overwritten. An interrupted producer
+    can be recovered only with its matching identity intent and before any fit
+    for the pair has returned. External caches are strictly read-only.
+    """
+    import numpy as np
+    from filelock import FileLock
+    identity = observed_dataset_identity(mechanism, task, config)
+    directory = Path(observed_data_from) if observed_data_from is not None else Path(output_dir) / "datasets"
+    if observed_data_from is not None:
+        return bind_observed_dataset(output_dir, identity, read_observed_dataset(directory, identity))
+    directory.mkdir(parents=True, exist_ok=True)
+    npz, receipt, intent = observed_dataset_paths(directory, identity)
+    if not receipt.exists():
+        with FileLock(str(receipt) + ".lock", timeout=600):
+            if not receipt.exists():
+                if _pair_has_returned_fit(output_dir, identity):
+                    raise ValueError("Cannot recreate observed data after a fit for this pair has returned")
+                if intent.exists():
+                    if json.loads(intent.read_text(encoding="utf-8")) != identity:
+                        raise ValueError("Observed dataset producer intent differs from its identity")
+                elif npz.exists():
+                    raise ValueError("Unidentified orphan observed dataset; refusing replacement")
+                else:
+                    atomic_json(intent, identity)
+                if npz.exists():
+                    # A matching producer wrote the complete atomic NPZ before
+                    # interruption. Adopt its bytes; never redraw/overwrite it.
+                    data = _read_observed_npz(npz, identity)
+                else:
+                    from mediencoder.simulation.dgp import sample_data
+                    generated = sample_data(mechanism, task["n"], task["data_seed"])
+                    data = {name: np.ascontiguousarray(generated[name]) for name in ("X", "M", "A", "Y")}
+                    validate_observed_arrays(data, identity)
+                    temporary = npz.with_name(npz.name + f".{os.getpid()}.tmp")
+                    with temporary.open("wb") as stream:
+                        np.savez(stream, **data)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, npz)
+                atomic_json(receipt, dict(identity=identity, npz_file=npz.name,
+                            npz_sha256=file_hash(npz), observed_data_sha256=observed_data_hash(data),
+                            arrays={name: dict(shape=list(array.shape), dtype=array.dtype.str)
+                                    for name, array in data.items()}))
+                try:
+                    intent.unlink(missing_ok=True)
+                except PermissionError:
+                    pass  # The completed receipt remains authoritative.
+    # Final data are immutable; reads/checksums do not serialize on the writer lock.
+    return bind_observed_dataset(output_dir, identity, read_observed_dataset(directory, identity))
 
 
 def task_estimation_options(config, task, training):
@@ -520,7 +669,6 @@ def task_estimation_options(config, task, training):
 
 def _run_task(task):
     import numpy as np
-    from mediencoder.simulation.dgp import sample_data
     from mediencoder.estimation import estimate_triply_IF, set_all_seeds
     config = _WORKER["config"]
     output_dir = _WORKER["output_dir"]
@@ -532,7 +680,8 @@ def _run_task(task):
     atomic_json(running_path, record)
     print(f"[{record['started_at']}] START {task['task_id']} worker={os.getpid()}", flush=True)
     try:
-        data = sample_data(_WORKER["mechanism"], task["n"], task["data_seed"])
+        data = cached_observed_data(_WORKER["mechanism"], task, config, output_dir,
+                                    _WORKER.get("observed_data_from"))
         record["observed_data_sha256"] = observed_data_hash(data)
         truth = float(_WORKER["mechanism"].truth.value)
         # True factors/nuisances are intentionally unavailable to the estimator call.
@@ -761,6 +910,8 @@ def parse_args(argv=None):
     parser.add_argument("--mechanism-seed", type=int, default=910000)
     parser.add_argument("--mechanism-from", type=Path, default=None,
                         help="Import the exact saved mechanism from a bundle directory, prefix, JSON or NPZ; DGP settings and parameter seed must match")
+    parser.add_argument("--observed-data-from", type=Path, default=None,
+                        help="Read paired X/M/A/Y bytes from this immutable datasets cache directory; missing or damaged data are errors (execution-only)")
     parser.add_argument("--weight-decay", type=float, default=0.0,
                         help="Shared Adam weight decay for representation, nuisance and tuning fits; recorded in scientific run identity (default 0)")
     parser.add_argument("--seed-base", type=int, default=20261019)
@@ -814,6 +965,9 @@ def _main_locked(args):
     report_config.update(shard_index=args.shard_index, num_shards=args.num_shards)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    observed_data_from = args.observed_data_from.resolve() if args.observed_data_from is not None else None
+    if observed_data_from is not None and not observed_data_from.is_dir():
+        raise ValueError("--observed-data-from must name an existing datasets cache directory")
     manifest_path = output_dir / "manifest.json"
     existing = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
     if args.num_shards > 1 and existing is None:
@@ -862,7 +1016,8 @@ def _main_locked(args):
         replication_indices=[0, report_config["B_requested"]-1],
         shard_index=args.shard_index, num_shards=args.num_shards,
         shard_replication_indices=list(range(args.shard_index, report_config["B_requested"], args.num_shards)),
-        shard_pending_tasks=len(pending), time_limit_seconds=time_limit))
+        shard_pending_tasks=len(pending), time_limit_seconds=time_limit,
+        observed_data_from=observed_data_from))
     counts = write_reports(output_dir, records, report_config, started, "summarized" if args.summarize_only else "running", args.workers)
     print(f"{config['run_kind']} {manifest['run_hash'][:12]}: complete={counts[0]} failed={counts[1]} requested={counts[2]} to_run={len(pending)}", flush=True)
     print(f"Population truth={mechanism.truth.value:.12g}; output={output_dir}", flush=True)
@@ -896,7 +1051,7 @@ def _main_locked(args):
                         slot["executor"] = ProcessPoolExecutor(
                             max_workers=1, mp_context=mp.get_context("spawn"),
                             initializer=_worker_init,
-                            initargs=(config, str(output_dir), str(prefix), manifest["run_hash"]))
+                            initargs=(config, str(output_dir), str(prefix), manifest["run_hash"], observed_data_from))
                         slot["completed"] = 0
                     submitted[task["task_id"]] = task
                     futures[slot["executor"].submit(_run_task, task)] = (task, slot)

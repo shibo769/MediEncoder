@@ -19,7 +19,7 @@ Live scheduler configuration was checked for `shibo` and project `adsgrp`.
 - No matching global CPU-slot quota for `shibo` or `adsgrp` was found. The 896/
   1024-slot rules inspected apply to MPI queues and are not an OMP allowance.
 - OMP allocates every core of a job on one node. Use many independent array jobs
-  to distribute replications across nodes. Prefer requests of 4, 8, or 16 cores.
+  to distribute replications across nodes. Benchmark 1, 2, 4, 8, and 16 cores.
   The scheduler's limits on queued jobs are not a promise of available cores.
 - `--cpu-slot-budget` is an execution budget chosen for this run, not an asserted
   SCC quota. A budget of 128 caps the CPU array at 128 cores across running
@@ -42,6 +42,16 @@ delta matrices in [0.9,1.1], nuisance layers (300,300), row-L2 alignment,
 fixed lambda weights, weight decay zero, and a maximum of 300 training epochs
 with the existing early-stopping rule. Each CPU/GPU plan has its own runtime
 fingerprint. Results from different devices or environments are not merged.
+
+For each sample size and replication, the runner generates X/M/A/Y once and
+keeps their exact bytes in `datasets/`. Every method reads those same inputs;
+receipts verify the mechanism, seed, dimensions, source, and checksums. This
+avoids numerical regeneration differences between workers. These are observed
+inputs, with no latent factors or oracle nuisances. Retain the cache for resume.
+`--observed-data-from /path/to/datasets` can read an existing matching cache
+without changing it, including for a CPU/GPU speed comparison. Missing or
+damaged imported data cause an error rather than regeneration. Trained network
+checkpoints remain disabled.
 
 The phases are:
 
