@@ -43,6 +43,10 @@ the ordinary package dependencies. Other version combinations are not certified.
 
 ## Main simulation and alignment ablation
 
+For unattended runs on BU SCC, see the [background experiment guide](docs/scc_background.md).
+It covers CPU/GPU throughput comparisons, scheduler resources, immutable source
+snapshots, independent replication arrays, validation gates, and same-seed resume.
+
 New main runs use fixed additive polynomial measurement maps of degree 3:
 `phi_k(f) = sum_j sum_{r=1}^3 C[k,j,r-1] * f[j]^r`, with independent Gaussian
 coefficients of variance `coef_scale^2 / 3`. X and M use separate loading streams.

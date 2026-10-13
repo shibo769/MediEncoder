@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 
 import numpy as np
@@ -24,6 +25,11 @@ def safe_file(root, relative):
     path = Path(root).joinpath(*relative.parts)
     if path.is_symlink() or not path.is_file() or Path(root).resolve() not in path.resolve().parents:
         raise ValueError(f"Missing or unsafe artifact: {text}")
+    current = path
+    while current != Path(root):
+        if current.is_symlink():
+            raise ValueError(f"Unsafe artifact symlink: {text}")
+        current = current.parent
     return path
 
 
@@ -41,6 +47,8 @@ def package_artifact(source, destination, kind, byte_limit):
         allowed = ("execution_plan.json", "status.json", "summary.csv", "main_table.tex",
                    "ablation_table.tex", "progress.html", "merge_audit.json", "merge_audit.md")
         files += [name for name in allowed if (source / name).is_file()]
+        files += [p.relative_to(source).as_posix()
+                  for p in sorted((source / "attempts").glob("*/*.json")) if p.is_file()]
     records = {}
     total = 0
     for name in files:
@@ -120,28 +128,63 @@ def validate_scores(record, directory, truth):
         raise ValueError("Record coverage differs from its own dataset-specific interval")
 
 
-def merge_artifacts(prepared, shards, output, target_reps, num_shards):
+def merge_artifacts(prepared, shards, output, target_reps, num_shards, *,
+                    expected_device="cpu", require_inventory=True,
+                    execution_platform="cloud"):
     from mediencoder.simulation.dgp import load_mechanism
     from mediencoder.simulation.monitor import render_report
     prepared, shards, output = Path(prepared), Path(shards), Path(output)
+    if output.is_symlink():
+        raise ValueError("Merged output cannot be a directory symlink")
     if output.exists() and any(output.iterdir()):
         raise ValueError("Merged output must be empty")
-    verify_inventory(prepared, "prepared")
+    if expected_device not in ("cpu", "cuda") or execution_platform not in ("cloud", "scc"):
+        raise ValueError("Unsupported aggregation device or platform")
+    if execution_platform == "cloud" and expected_device != "cpu":
+        raise ValueError("Cloud aggregation only accepts its separate CPU experiment")
+    if not isinstance(num_shards, int) or isinstance(num_shards, bool) or num_shards < 1:
+        raise ValueError("num_shards must be a positive integer")
+    if require_inventory:
+        verify_inventory(prepared, "prepared")
+    for name in ("manifest.json", "mechanism.json", "mechanism.npz"):
+        safe_file(prepared, name)
     manifest = _read(prepared / "manifest.json")
     identity = {key: manifest[key] for key in ("config", "code_hashes", "mechanism_hash", "environment")}
     if runner.digest(identity) != manifest["run_hash"] or runner.collect_code_hashes() != manifest["code_hashes"]:
         raise ValueError("Prepared scientific/source fingerprint is invalid or differs from this checkout")
-    if manifest["config"]["device"] != "cpu":
-        raise ValueError("Cloud aggregation only accepts its separate CPU experiment")
+    if manifest["config"]["device"] != expected_device:
+        raise ValueError(f"Aggregation expected device {expected_device}; cannot mix CPU/GPU runs")
     mechanism = load_mechanism(prepared / "mechanism")
     if mechanism.mechanism_hash != manifest["mechanism_hash"]:
         raise ValueError("Prepared mechanism differs from the manifest")
     phase = runner.execution_config(manifest["config"], target_reps)
     expected = {task["task_id"]: task for task in runner.build_tasks(phase)}
-    records, locations, seen_shards, paired = {}, {}, set(), {}
+    records, locations, seen_shards, paired, attempts = {}, {}, set(), {}, {}
+    def check_pairing(record):
+        data_hash = record.get("observed_data_sha256")
+        if record["status"] == "complete" and not data_hash:
+            raise ValueError("Completed fit is missing the observed-data pairing hash")
+        if data_hash:
+            if not isinstance(data_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", data_hash):
+                raise ValueError("Malformed observed-data pairing hash")
+            pair = record["n"], record["rep"]
+            if pair in paired and paired[pair] != data_hash:
+                raise ValueError("Methods or retained attempts were not fitted on identical paired observed data")
+            paired[pair] = data_hash
     shard_directories = sorted(p for p in shards.iterdir() if p.is_dir()) if shards.is_dir() else []
     for shard_dir in shard_directories:
-        verify_inventory(shard_dir, "shard")
+        if shard_dir.is_symlink() or shard_dir.resolve().parent != shards.resolve():
+            raise ValueError("Shard directory escapes its designated artifact root")
+        if not (shard_dir / "manifest.json").exists():
+            # Array elements can remain queued or fail before their first write.
+            # Empty output directories represent missing work, never success.
+            if any(p.is_file() for p in shard_dir.rglob("*")):
+                raise ValueError("Shard has artifacts but no scientific manifest")
+            continue
+        if require_inventory:
+            verify_inventory(shard_dir, "shard")
+        safe_file(shard_dir, "manifest.json")
+        safe_file(shard_dir, "execution_plan.json")
         runner.validate_manifest(manifest, _read(shard_dir / "manifest.json"))
         plan = _read(shard_dir / "execution_plan.json")
         index = plan["shard_index"]
@@ -150,10 +193,30 @@ def merge_artifacts(prepared, shards, output, target_reps, num_shards):
                 or index in seen_shards):
             raise ValueError("Inconsistent or duplicate shard execution plan")
         seen_shards.add(index)
+        for path in sorted((shard_dir / "attempts").glob("*/*.json")):
+            relative = path.relative_to(shard_dir).as_posix()
+            safe_file(shard_dir, relative)
+            previous = _read(path)
+            key = previous.get("task_id")
+            if (key not in expected or path.parent.name != key
+                    or previous.get("rep", -1) % num_shards != index
+                    or any(previous.get(k) != v for k, v in expected[key].items())
+                    or previous.get("status") != "failed"
+                    or previous.get("run_hash") != manifest["run_hash"]
+                    or previous.get("mechanism_hash") != mechanism.mechanism_hash
+                    or previous.get("theta_population") != float(mechanism.truth.value)
+                    or path.stem != runner.digest(previous)[:16]):
+                raise ValueError("Archived failed attempt differs from its reserved task or checksum")
+            if relative in attempts:
+                raise ValueError("Duplicate archived task attempt")
+            check_pairing(previous)
+            attempts[relative] = path
         for path in sorted((shard_dir / "tasks").glob("*.json")):
+            safe_file(shard_dir, path.relative_to(shard_dir).as_posix())
             record = _read(path)
             key = record["task_id"]
-            if key not in expected or key in records or record["rep"] % num_shards != index:
+            if (key not in expected or key in records or record["rep"] % num_shards != index
+                    or path.name != key + ".json"):
                 raise ValueError("Unexpected, duplicate, or wrongly assigned task record")
             if any(record.get(k) != v for k, v in expected[key].items()):
                 raise ValueError("Task seeds or metadata differ from the reserved experiment")
@@ -161,14 +224,7 @@ def merge_artifacts(prepared, shards, output, target_reps, num_shards):
                 raise ValueError("Task mechanism hash differs from the shared mechanism")
             if record.get("theta_population") != float(mechanism.truth.value):
                 raise ValueError("Task truth differs from the fixed population truth")
-            data_hash = record.get("observed_data_sha256")
-            if record["status"] == "complete" and not data_hash:
-                raise ValueError("Completed fit is missing the observed-data pairing hash")
-            if data_hash:
-                pair = record["n"], record["rep"]
-                if pair in paired and paired[pair] != data_hash:
-                    raise ValueError("Methods were not fitted on identical paired observed data")
-                paired[pair] = data_hash
+            check_pairing(record)
             # Check the relative path before the generic checkpoint validator opens it.
             if record["status"] == "complete":
                 if record["score_artifact"].replace("\\", "/") != f"scores/{key}.npz":
@@ -181,6 +237,10 @@ def merge_artifacts(prepared, shards, output, target_reps, num_shards):
     output.mkdir(parents=True, exist_ok=True)
     for name in ("manifest.json", "mechanism.json", "mechanism.npz"):
         shutil.copy2(prepared / name, output / name)
+    for relative, path in attempts.items():
+        destination = output / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
     for key, record in records.items():
         destination = output / "tasks" / (key + ".json")
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -194,23 +254,27 @@ def merge_artifacts(prepared, shards, output, target_reps, num_shards):
     missing = sorted(set(expected)-set(records))
     failed = sorted(key for key, record in records.items() if record["status"] == "failed")
     complete = not missing and len(seen_shards) == num_shards
-    state = "finished" if complete and not failed else "complete_with_failures" if complete else "incomplete_cloud_run"
+    state = "finished" if complete and not failed else "complete_with_failures" if complete else f"incomplete_{execution_platform}_run"
     runner.write_reports(output, records, phase, runner.utc_now(), state, 0)
     render_report(output)
     audit = dict(run_hash=manifest["run_hash"], reserved_reps=manifest["config"]["B_requested"],
                  target_reps=target_reps, expected_tasks=len(expected), retained_tasks=len(records),
                  completed=len(records)-len(failed), failed_tasks=failed, missing_tasks=missing,
                  shard_count=len(seen_shards), num_shards=num_shards, complete=complete,
-                 all_records_validated=True, combined_with_local_gpu=False)
+                 all_records_validated=True, combined_with_local_gpu=False,
+                 execution_platform=execution_platform, device=expected_device,
+                 environment=manifest["environment"], archived_failed_attempts=len(attempts))
     runner.atomic_json(output / "merge_audit.json", audit)
-    report = (f"# Synthetic CPU simulation\n\nScientific run: `{manifest['run_hash']}`\n\n"
+    report = (f"# Synthetic {expected_device.upper()} simulation on {execution_platform.upper()}\n\nScientific run: `{manifest['run_hash']}`\n\n"
               f"Target {target_reps}; reserved {manifest['config']['B_requested']} replications per size and arm.\n\n"
               f"Validated tasks: {len(records)}/{len(expected)}; failed fits: {len(failed)}; missing: {len(missing)}. "
               f"Shards: {len(seen_shards)}/{num_shards}.\n\n"
               "The fixed mechanism, source/run fingerprints, task seeds, score checksums, fold coverage, "
               "point estimates, standard errors and dataset-specific intervals were checked. "
               "Failed fits remain explicit. Partial results are not final paper tables. "
-              "No local GPU results or real datasets were merged.\n")
+              f"Archived failed attempts retained: {len(attempts)}. "
+              "All shards share one device and runtime fingerprint. "
+              "No results from other runs or real datasets were merged.\n")
     runner.atomic_text(output / "merge_audit.md", report)
     print(report)
     return 0 if complete and not failed else 2

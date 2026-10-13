@@ -82,15 +82,17 @@ def render_report(output):
     completed = status.get('completed', 0)
     failed = status.get('failed', 0)
     requested = status.get('requested', planned)
+    me_label = 'Fixed ME' if config.get('lambda_mode') == 'fixed' else 'Tuning'
+    me_description = 'fixed-weight' if config.get('lambda_mode') == 'fixed' else 'tuned'
     stamp = html.escape(status.get('updated_at', datetime.now(timezone.utc).isoformat()))
     page = f'''<!doctype html><html lang="en"><meta charset="utf-8">
 <meta http-equiv="refresh" content="60"><title>{title}</title>
 <style>body{{font:16px/1.5 system-ui,sans-serif;max-width:1200px;margin:40px auto;padding:0 24px;color:#172033;background:#f7f8fa}}h1{{font-size:28px}}h2{{font-size:22px;margin-top:36px}}table{{border-collapse:collapse;width:100%;background:white;font-variant-numeric:tabular-nums}}th,td{{padding:9px 12px;border-bottom:1px solid #dbe0e7;text-align:right}}th{{background:#eaf0f6}}td:nth-child(2){{text-align:left}}.status{{padding:16px;background:#eaf0f6;border-radius:8px}}.note{{color:#4c5667}}a{{color:#175ca8}}</style>
 <h1>{title}</h1><p class="status"><b>{completed:,} valid / {requested:,} planned fits</b>; {failed} failed; {pending:,} pending. Phase: {html.escape(phase)}.<br>Updated {stamp} (UTC). This page refreshes every minute.</p>
 <p>p={cell(dgp.get('p'))}, q={cell(dgp.get('q'))}; latent dimensions {cell(dgp.get('bar_p'))}/{cell(dgp.get('bar_q'))}; learned dimensions {cell(config.get('tilde_p'))}/{cell(config.get('tilde_q'))}; {target} replications per size and arm in this execution phase, with {reserved} reserved. Run kind: {html.escape(config.get('run_kind', 'starting'))}. Fixed mechanism; population truth; loss normalization: {html.escape(str(config.get('loss_normalization', 'not recorded')))}; retained stop-gradient; dataset-specific within-fold influence-function confidence intervals.</p>
-<p class="note">Partial estimates are provisional. Coverage is conditional on valid completed replications. The two tables reuse the same tuned MediEncoder fits. No manuscript or proof has been changed.</p>
+<p class="note">Partial estimates are provisional. Coverage is conditional on valid completed replications. The two tables reuse the same {me_description} MediEncoder fits. No manuscript or proof has been changed.</p>
 <h2>Main comparison</h2><table><thead><tr><th>n</th><th>Estimator</th><th>SD</th><th>RMSE</th><th>CI length</th><th>Coverage</th><th>Valid / planned; failures</th></tr></thead><tbody>{''.join(main)}</tbody></table>
-<h2>Alignment ablation</h2><table><thead><tr><th></th><th colspan="2">SD</th><th colspan="2">RMSE</th><th colspan="2">CI length</th><th>Valid counts</th></tr><tr><th>n</th><th>lambda3=0</th><th>Tuning</th><th>lambda3=0</th><th>Tuning</th><th>lambda3=0</th><th>Tuning</th><th>Zero / tuning</th></tr></thead><tbody>{''.join(ablation)}</tbody></table>
+<h2>Alignment ablation</h2><table><thead><tr><th></th><th colspan="2">SD</th><th colspan="2">RMSE</th><th colspan="2">CI length</th><th>Valid counts</th></tr><tr><th>n</th><th>lambda3=0</th><th>{me_label}</th><th>lambda3=0</th><th>{me_label}</th><th>lambda3=0</th><th>{me_label}</th><th>Zero / {me_label}</th></tr></thead><tbody>{''.join(ablation)}</tbody></table>
 <p><a href="summary.csv">Full summary CSV</a> · <a href="manifest.json">Run configuration and provenance</a> · <a href="status.json">Detailed status</a> · <a href="run.log">Execution log</a></p></html>'''
     atomic_write(output / 'progress.html', page)
 
@@ -137,6 +139,9 @@ def stop_owned_process_tree(proc):
 
 
 def main(argv=None):
+    from mediencoder.simulation.runner import (ExecutionInterrupted, PARTIAL_EXIT_CODE,
+                                               install_execution_signal_handlers,
+                                               restore_signal_handlers)
     output, command = monitor_command(argv)
     output.mkdir(parents=True, exist_ok=True)
     keep_awake = os.name == 'nt'
@@ -145,6 +150,7 @@ def main(argv=None):
     record = {'supervisor_pid': os.getpid(), 'command': command,
               'started_at': datetime.now(timezone.utc).isoformat()}
     proc = None
+    previous = install_execution_signal_handlers()
     try:
         with (output / 'run.log').open('a', encoding='utf-8', buffering=1) as log:
             log.write('\nSUPERVISOR START ' + record['started_at'] + '\n')
@@ -161,6 +167,12 @@ def main(argv=None):
             record.update(exit_code=proc.returncode, finished_at=datetime.now(timezone.utc).isoformat())
             atomic_write(output / 'supervisor.json', json.dumps(record, indent=2))
             return proc.returncode
+    except ExecutionInterrupted as exc:
+        record['interruption_phase'] = exc.phase
+        return PARTIAL_EXIT_CODE
+    except KeyboardInterrupt:
+        record['interruption_phase'] = 'interrupted_SIGINT'
+        return PARTIAL_EXIT_CODE
     finally:
         try:
             if proc is not None and proc.poll() is None:
@@ -169,10 +181,12 @@ def main(argv=None):
                               finished_at=datetime.now(timezone.utc).isoformat())
                 atomic_write(output / 'supervisor.json', json.dumps(record, indent=2))
                 status = read_json(output / 'status.json')
-                status.update(phase='interrupted', active_tasks=[], updated_at=record['finished_at'])
+                status.update(phase=record.get('interruption_phase', 'interrupted'),
+                              active_tasks=[], updated_at=record['finished_at'])
                 atomic_write(output / 'status.json', json.dumps(status, indent=2))
                 render_report(output)
         finally:
+            restore_signal_handlers(previous)
             if keep_awake:
                 ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
 

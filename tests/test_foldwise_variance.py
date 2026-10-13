@@ -74,6 +74,7 @@ def test_joint_contrast_variance_equals_direct_scalar_aggregation():
 
 @pytest.mark.parametrize("use_pooled_se", [False, True])
 def test_simulation_worker_checks_fold_variance_and_saves_failure(monkeypatch, tmp_path, use_pooled_se):
+    from pathlib import Path
     from types import SimpleNamespace
     from mediencoder.simulation import dgp, runner
 
@@ -93,9 +94,17 @@ def test_simulation_worker_checks_fold_variance_and_saves_failure(monkeypatch, t
                                                mechanism=mechanism, run_hash="fixture", training={}))
     monkeypatch.setattr(dgp, "sample_data", lambda *args: data.copy())
     monkeypatch.setattr(estimation, "estimate_triply_IF", lambda *args, **kwargs: result)
+    marker = tmp_path / "running" / "fixture.json"
+    original_unlink = Path.unlink
+    def shared_progress_marker(path, *args, **kwargs):
+        if path == marker:
+            raise PermissionError("Windows reader has the progress marker open")
+        return original_unlink(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "unlink", shared_progress_marker)
     task = dict(task_id="fixture", method="projection", n=8, data_seed=10, training_seed=20, rep=0)
     record = runner._run_task(task)
     assert (tmp_path / "tasks" / "fixture.json").is_file()
+    assert marker.is_file()  # Marker deletion belongs to the supervising parent.
     if use_pooled_se:
         assert record["status"] == "failed"
         assert "within-fold" in record["error_message"]

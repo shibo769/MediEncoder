@@ -25,11 +25,13 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import platform
+import signal
 import statistics
 import sys
 import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timezone
 
 
@@ -40,6 +42,126 @@ LABELS = dict(zip(METHODS, ("Projection", "Autoencoder", "VAE", "MediEncoder", r
 SOURCE_NAMES = ("simulation/runner.py", "simulation/dgp.py", "estimation.py",
                 "training.py", "models.py", "nn_utils.py")
 _WORKER = {}
+PARTIAL_EXIT_CODE = 4
+
+
+class ExecutionInterrupted(BaseException):
+    """An execution interruption never changes a statistical task's outcome."""
+
+    def __init__(self, phase):
+        self.phase = phase
+        super().__init__(phase)
+
+
+def install_execution_signal_handlers():
+    """Interrupt once, then allow bounded cleanup to finish before restoring."""
+    previous = {}
+    interrupted = False
+
+    def interrupt(signum, frame):
+        nonlocal interrupted
+        if interrupted:
+            return
+        interrupted = True
+        raise ExecutionInterrupted("interrupted_" + signal.Signals(signum).name)
+
+    for name in ("SIGTERM", "SIGUSR2"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, interrupt)
+    return previous
+
+
+def restore_signal_handlers(previous):
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
+def stop_executor_workers(executor, futures, grace_seconds=5.0, propagate_interruption=True):
+    """Cancel queued work and stop only the given executors' process objects.
+
+    Python 3.11/3.12 do not expose terminate_workers(). Prevent the manager from
+    replacing recycled workers while shutdown starts, and retain its handles
+    before shutdown(wait=False) clears the executor's references.
+    """
+    executors = executor if isinstance(executor, list) else [executor]
+    previous, deferred = {}, []
+    def defer(signum, frame):
+        deferred.append(signum)
+    # A second scheduler signal must not interrupt cleanup halfway through and
+    # strand a captured process after shutdown has cleared executor references.
+    for name in ("SIGTERM", "SIGUSR2"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, defer)
+    try:
+        for future in futures:
+            future.cancel()
+        processes, managers = [], []
+        for pool in executors:
+            with pool._shutdown_lock:
+                pool._max_workers = 0
+                processes.extend((pool._processes or {}).values())
+                if pool._executor_manager_thread is not None:
+                    managers.append(pool._executor_manager_thread)
+            pool.shutdown(wait=False, cancel_futures=True)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        until = time.monotonic() + grace_seconds
+        for process in processes:
+            process.join(timeout=max(0.0, until-time.monotonic()))
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+        until = time.monotonic() + grace_seconds
+        for process in processes:
+            process.join(timeout=max(0.0, until-time.monotonic()))
+        until = time.monotonic() + grace_seconds
+        for manager in managers:
+            manager.join(timeout=max(0.0, until-time.monotonic()))
+    finally:
+        restore_signal_handlers(previous)
+    if deferred and propagate_interruption:
+        raise ExecutionInterrupted("interrupted_" + signal.Signals(deferred[0]).name)
+
+
+def load_task_records(output_dir, manifest, expected):
+    """Read durable records, including work finished just before interruption."""
+    records = {}
+    for path in sorted((output_dir / "tasks").glob("*.json")):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if record["task_id"] not in expected:
+            raise ValueError(f"Unexpected checkpoint: {path}")
+        validate_checkpoint(record, manifest, output_dir)
+        for key, value in expected[record["task_id"]].items():
+            if record.get(key) != value:
+                raise ValueError(f"Checkpoint task metadata mismatch: {path}: {key}")
+        records[record["task_id"]] = record
+    return records
+
+
+def clear_running_markers(output_dir, tasks, grace_seconds=1.0):
+    """The parent owns marker deletion; Windows readers may briefly hold a file.
+
+    A diagnostic marker must never turn a durably saved successful fit into a
+    failed replication. Retry transient sharing violations for a bounded time.
+    """
+    for task in tasks:
+        path = output_dir / "running" / (task["task_id"] + ".json")
+        until = time.monotonic() + grace_seconds
+        while True:
+            try:
+                path.unlink(missing_ok=True)
+                break
+            except PermissionError:
+                if time.monotonic() >= until:
+                    print(f"Progress marker still busy: {path}. Durable task outcome is retained.",
+                          file=sys.stderr, flush=True)
+                    break
+                time.sleep(.02)
 
 
 def utc_now():
@@ -473,7 +595,8 @@ def _run_task(task):
             record["failed_tuning_candidates"] = exc.tuning_rows
     record.update(finished_at=utc_now(), elapsed_seconds=time.monotonic()-started)
     atomic_json(output_dir / "tasks" / (task["task_id"] + ".json"), record)
-    running_path.unlink(missing_ok=True)
+    # The parent reads progress markers and owns their deletion after receiving
+    # this durable outcome. Concurrent read/unlink otherwise races on Windows.
     return jsonable(record)
 
 
@@ -524,9 +647,11 @@ def table_texts(rows, config):
               f"% Run kind: {config['run_kind']}. Partial rows are not final paper results.\n")
     main = [caveat, r"\begin{tabular}{rlrrrr}", r"\toprule",
             r"$n$ & Estimator & SD & RMSE & CI Length & Coverage \\", r"\midrule"]
+    me_label = "Fixed ME" if config.get("lambda_mode") == "fixed" else "Tuning"
     abl = [caveat, r"\begin{tabular}{rrrrrrr}", r"\toprule",
            r"& \multicolumn{2}{c}{SD} & \multicolumn{2}{c}{RMSE} & \multicolumn{2}{c}{CI Length} \\",
-           r"$n$ & $\lambda_3=0$ & Tuning & $\lambda_3=0$ & Tuning & $\lambda_3=0$ & Tuning \\", r"\midrule"]
+           "$n$ & $\\lambda_3=0$ & " + me_label + " & $\\lambda_3=0$ & " + me_label
+           + " & $\\lambda_3=0$ & " + me_label + r" \\", r"\midrule"]
     for n in config["n_values"]:
         for i, method in enumerate(MAIN_METHODS):
             r = result(n, method)
@@ -599,7 +724,9 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--tasks-per-worker", type=int, default=1,
-                        help="Recycle worker processes to release CPU/CUDA allocations (default 1)")
+                        help="Replace a worker's single-process pool after this many fits to release CPU/CUDA allocations (default 1)")
+    parser.add_argument("--time-limit-seconds", type=float, default=None,
+                        help="Execution-only deadline, including preparation; stop owned workers and return 4, preserving completed tasks for resumption")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--n", type=lambda s: [int(x) for x in s.split(",")], default=[100,300,800,1200,2000,3000])
     parser.add_argument("--p", type=int, default=500, help="Number of observed covariates (default 500)")
@@ -658,6 +785,9 @@ def parse_args(argv=None):
         parser.error(str(exc))
     if args.tasks_per_worker < 1:
         parser.error("--tasks-per-worker must be positive")
+    if args.time_limit_seconds is not None and (
+            not math.isfinite(args.time_limit_seconds) or args.time_limit_seconds <= 0):
+        parser.error("--time-limit-seconds must be finite and positive")
     if args.p < 1 or args.q < 1:
         parser.error("--p and --q must be positive")
     if args.target_reps is not None and not 1 <= args.target_reps <= args.reps:
@@ -676,6 +806,8 @@ def parse_args(argv=None):
 
 
 def _main_locked(args):
+    time_limit = getattr(args, "time_limit_seconds", None)
+    deadline = None if time_limit is None else time.monotonic() + time_limit
     configure_environment(args.device)
     config = make_config(args)
     report_config = execution_config(config, args.target_reps)
@@ -708,16 +840,7 @@ def _main_locked(args):
         atomic_json(manifest_path, manifest)
     tasks = list(build_tasks(config))
     expected = {t["task_id"]: t for t in tasks}
-    records = {}
-    for path in sorted((output_dir / "tasks").glob("*.json")):
-        record = json.loads(path.read_text(encoding="utf-8"))
-        if record["task_id"] not in expected:
-            raise ValueError(f"Unexpected checkpoint: {path}")
-        validate_checkpoint(record, manifest, output_dir)
-        for key, value in expected[record["task_id"]].items():
-            if record.get(key) != value:
-                raise ValueError(f"Checkpoint task metadata mismatch: {path}: {key}")
-        records[record["task_id"]] = record
+    records = load_task_records(output_dir, manifest, expected)
     started = utc_now()
     pending = [t for t in tasks if t["task_id"] not in records
                or (args.retry_failed and records[t["task_id"]]["status"] == "failed")]
@@ -739,7 +862,7 @@ def _main_locked(args):
         replication_indices=[0, report_config["B_requested"]-1],
         shard_index=args.shard_index, num_shards=args.num_shards,
         shard_replication_indices=list(range(args.shard_index, report_config["B_requested"], args.num_shards)),
-        shard_pending_tasks=len(pending)))
+        shard_pending_tasks=len(pending), time_limit_seconds=time_limit))
     counts = write_reports(output_dir, records, report_config, started, "summarized" if args.summarize_only else "running", args.workers)
     print(f"{config['run_kind']} {manifest['run_hash'][:12]}: complete={counts[0]} failed={counts[1]} requested={counts[2]} to_run={len(pending)}", flush=True)
     print(f"Population truth={mechanism.truth.value:.12g}; output={output_dir}", flush=True)
@@ -750,37 +873,93 @@ def _main_locked(args):
     iterator = iter(pending)
     phase = ("benchmark_batch_finished" if args.max_tasks is not None else
              "shard_finished" if args.num_shards > 1 else "finished")
+    # Independent slots avoid ProcessPoolExecutor's max_tasks_per_child
+    # replacement bookkeeping. A completed slot can recycle immediately while
+    # other slots keep fitting, without a batch-wide barrier.
+    slots = [dict(executor=None, completed=0) for _ in range(args.workers)]
+    futures = {}
+    submitted = {}
+    interrupted = False
+
+    def check_deadline():
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ExecutionInterrupted("time_limit_reached")
+
     try:
-        with ProcessPoolExecutor(max_workers=args.workers, mp_context=mp.get_context("spawn"),
-                                 max_tasks_per_child=args.tasks_per_worker,
-                                 initializer=_worker_init,
-                                 initargs=(config, str(output_dir), str(prefix), manifest["run_hash"])) as executor:
-            futures = {}
-            def submit_next():
+        if pending:
+            check_deadline()
+            def submit_next(slot):
+                check_deadline()
                 task = next(iterator, None)
                 if task is not None:
-                    futures[executor.submit(_run_task, task)] = task
-            for _ in range(min(2*args.workers, len(pending))):
-                submit_next()
+                    if slot["executor"] is None:
+                        slot["executor"] = ProcessPoolExecutor(
+                            max_workers=1, mp_context=mp.get_context("spawn"),
+                            initializer=_worker_init,
+                            initargs=(config, str(output_dir), str(prefix), manifest["run_hash"]))
+                        slot["completed"] = 0
+                    submitted[task["task_id"]] = task
+                    futures[slot["executor"].submit(_run_task, task)] = (task, slot)
+            for slot in slots[:len(pending)]:
+                submit_next(slot)
             while futures:
-                done, _ = wait(futures, timeout=30, return_when=FIRST_COMPLETED)
+                check_deadline()
+                wait_seconds = 30 if deadline is None else min(30, max(0, deadline-time.monotonic()))
+                done, _ = wait(futures, timeout=wait_seconds, return_when=FIRST_COMPLETED)
+                check_deadline()
                 if not done:
-                    write_reports(output_dir, records, report_config, started, "running", args.workers, list(futures.values()))
+                    write_reports(output_dir, records, report_config, started, "running", args.workers,
+                                  [task for task, slot in futures.values()])
                     continue
                 for future in done:
-                    task = futures.pop(future)
+                    task, slot = futures.pop(future)
                     result = future.result()
                     records[task["task_id"]] = result
-                    counts = write_reports(output_dir, records, report_config, started, "running", args.workers, list(futures.values()))
+                    clear_running_markers(output_dir, [task])
+                    counts = write_reports(output_dir, records, report_config, started, "running", args.workers,
+                                           [task for task, active_slot in futures.values()])
                     print(f"[{utc_now()}] {task['task_id']} {result['status']} {result['elapsed_seconds']:.1f}s; complete={counts[0]} failed={counts[1]}/{counts[2]}", flush=True)
                     if result["status"] == "failed":
                         print(f"  {result['error_type']}: {result['error_message']}", flush=True)
-                    submit_next()
+                    slot["completed"] += 1
+                    if slot["completed"] >= args.tasks_per_worker:
+                        # The fit is durably saved and this slot is idle. Retire
+                        # only its process, while other slots continue training.
+                        stop_executor_workers(slot["executor"], [])
+                        slot["executor"] = None
+                    submit_next(slot)
+    except ExecutionInterrupted as exc:
+        interrupted = True
+        phase = exc.phase
+        print(f"Execution stopped: {phase}. Completed tasks are retained; unfinished tasks keep their original seeds.", flush=True)
+    except KeyboardInterrupt:
+        interrupted = True
+        phase = "interrupted_SIGINT"
+        print("Execution stopped: interrupted_SIGINT. Completed tasks are retained.", flush=True)
+    except BrokenProcessPool:
+        interrupted = True
+        phase = "interrupted_or_worker_error"
+        traceback.print_exc()
     except BaseException:
+        interrupted = True
         phase = "interrupted_or_worker_error"
         raise
     finally:
+        pools = [slot["executor"] for slot in slots if slot["executor"] is not None]
+        if pools:
+            # At normal completion all submitted fits are already saved. On an
+            # interruption unfinished fits remain pending. Either way, retire
+            # all owned slots within one shared grace interval.
+            stop_executor_workers(pools, futures, propagate_interruption=False)
+        # Task writes precede delivery through the process pool. Recover records
+        # even if a worker/parent was interrupted while returning its result.
+        records = load_task_records(output_dir, manifest, expected)
+        # Keep the submitted inventory separately: a crashed future has already
+        # been popped when result() raises and still needs its marker removed.
+        clear_running_markers(output_dir, submitted.values())
         counts = write_reports(output_dir, records, report_config, started, phase, args.workers)
+    if interrupted:
+        return PARTIAL_EXIT_CODE
     return 2 if counts[1] else 0
 
 
@@ -803,9 +982,16 @@ def main(argv=None):
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr, flush=True)
         return 3
+    previous = {}
     try:
-        return _main_locked(args)
+        previous = install_execution_signal_handlers()
+        try:
+            return _main_locked(args)
+        except ExecutionInterrupted as exc:
+            print(f"Execution stopped during preparation: {exc.phase}.", file=sys.stderr, flush=True)
+            return PARTIAL_EXIT_CODE
     finally:
+        restore_signal_handlers(previous)
         lock.release()
 
 
