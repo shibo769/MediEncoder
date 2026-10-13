@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -140,6 +141,8 @@ def validate_resources(resources):
     if resources["cores"] > resources["cpu_slot_limit"]:
         raise ValueError("CPU cores exceed the recorded execution slot budget")
     if resources["device"] == "cuda":
+        if resources["workers"] != 1:
+            raise ValueError("Safe SCC GPU execution requires one worker per GPU; GPU process sharing has not been validated")
         quota, _ = GPU_POOLS[resources["gpu_pool"]]
         if resources["concurrency"] > quota:
             raise ValueError(f"GPU concurrency exceeds the verified {resources['gpu_pool']} quota of {quota}")
@@ -273,10 +276,44 @@ def measured_workers(plan):
     if verified.get("results_sha256") != sha256(Path(plan["run_dir"]) / "benchmark_results.json"):
         raise ValueError("Benchmark results changed after worker selection")
     selected = verified["selected_workers"]
-    candidates = (1, 2, 4, 8) if plan["resources"]["device"] == "cuda" else (1, 2, 4, 8, 16)
-    if selected not in candidates or selected > plan["resources"]["cores"]:
+    if selected not in benchmark_workers(plan):
         raise ValueError("Benchmark selected an unsupported worker count")
     return selected
+
+
+def benchmark_workers(plan):
+    # SCC may configure allocated GPUs in EXCLUSIVE_PROCESS mode. Until a
+    # sharing mechanism is explicitly verified, one Python worker owns one GPU.
+    candidates = (1,) if plan["resources"]["device"] == "cuda" else (1, 2, 4, 8, 16)
+    return [value for value in candidates if value <= plan["resources"]["cores"]]
+
+
+def array_allocation(plan, workers):
+    resources = plan["resources"]
+    if workers not in benchmark_workers(plan):
+        raise ValueError("Unsupported worker count for this SCC execution mode")
+    gpu = resources["device"] == "cuda"
+    cores = resources["cores"] if gpu else workers
+    concurrency = (resources["concurrency"] if gpu else
+                   min(resources["concurrency"], resources["cpu_slot_limit"] // cores))
+    return dict(cores=cores, concurrency=min(concurrency, plan["num_shards"]))
+
+
+def benchmark_metrics(plan, workers, completed, elapsed_seconds):
+    if not math.isfinite(elapsed_seconds) or elapsed_seconds <= 0:
+        raise ValueError("Benchmark duration must be finite and positive")
+    if not isinstance(completed, int) or completed < 0:
+        raise ValueError("Completed benchmark fits must be a nonnegative integer")
+    allocation = array_allocation(plan, workers)
+    rate = completed*3600/elapsed_seconds
+    reserved_hours = plan["resources"]["cores"]*elapsed_seconds/3600
+    return dict(fits_per_hour=rate, reserved_core_hours=reserved_hours,
+                fits_per_core_hour=completed/reserved_hours,
+                formal_cores_per_element=allocation["cores"],
+                projected_formal_fits_per_core_hour=rate/allocation["cores"],
+                projected_array_concurrency=allocation["concurrency"],
+                projected_aggregate_fits_per_hour=rate*allocation["concurrency"],
+                projection_note="Execution-budget projection; queue availability and full-setting throughput must be checked with the canary")
 
 
 def process_tree_rss_mib(pid, proc_root=Path("/proc")):
@@ -396,9 +433,9 @@ def qsub_argv(plan, phase, job_name, dependency=None, retry_failed=False):
     hours, remainder = divmod(resources["wall_seconds"], 3600)
     minutes, seconds = divmod(remainder, 60)
     gpu = phase != "merge" and resources["device"] == "cuda"
-    cores = (1 if phase == "merge" else
-             measured_workers(plan) if resources["device"] == "cpu" and phase in ("canary", "array")
-             else resources["cores"])
+    allocation = (array_allocation(plan, 1 if resources["device"] == "cuda" else measured_workers(plan))
+                  if phase in ("canary", "array") else None)
+    cores = (1 if phase == "merge" else allocation["cores"] if allocation else resources["cores"])
     argv = ["qsub", "-terse", "-sync", "n", "-r", "n", "-notify", "-P", resources["project"],
             "-N", job_name, "-j", "y", "-m", "n", "-o", str(Path(plan["run_dir"]) / "logs"),
             "-l", f"h_rt={hours:02d}:{minutes:02d}:{seconds:02d}",
@@ -408,10 +445,7 @@ def qsub_argv(plan, phase, job_name, dependency=None, retry_failed=False):
         argv += ["-q", GPU_POOLS[resources["gpu_pool"]][1]]
         argv += ["-l", f"gpus=1,gpu_type={resources['gpu_type']},gpu_memory={resources['gpu_memory_gb']}G"]
     if phase == "array":
-        concurrency = (resources["concurrency"] if gpu else
-                       min(resources["concurrency"], resources["cpu_slot_limit"] // cores))
-        concurrency = min(concurrency, plan["num_shards"])
-        argv += ["-t", "1-200", "-tc", str(concurrency)]
+        argv += ["-t", "1-200", "-tc", str(allocation["concurrency"])]
     if retry_failed:
         if phase not in ("canary", "array"):
             raise ValueError("Failed-fit retries apply only to canary or array execution")
@@ -589,8 +623,7 @@ def execute(root, phase):
         rows = []
         round_name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
         deadline = time.monotonic() + limit
-        candidates = (1, 2, 4, 8) if plan["resources"]["device"] == "cuda" else (1, 2, 4, 8, 16)
-        candidates = [value for value in candidates if value <= plan["resources"]["cores"]]
+        candidates = benchmark_workers(plan)
         if not candidates:
             raise ValueError("No supported benchmark worker count fits the CPU allocation")
         # The same balanced task mix is timed at every worker count, and the
@@ -616,15 +649,18 @@ def execute(root, phase):
                             for path in (destination / "tasks").glob("*.json"))
             rows.append(dict(workers=workers, **profile, epoch_cap=20, benchmark_only=True,
                              expected_tasks=expected_tasks, completed=completed,
-                             fits_per_hour=completed*3600/profile["elapsed_seconds"],
+                             **benchmark_metrics(plan, workers, completed, profile["elapsed_seconds"]),
                              status=status, command=command, output=str(destination)))
             atomic_json(root / "benchmark_results.json", dict(plan_hash=plan["plan_hash"], rows=rows))
             if profile["exit_code"] != 0 or completed != expected_tasks:
                 return profile["exit_code"] or 2
-        best = max(rows, key=lambda row: row["fits_per_hour"])
+        best = max(rows, key=lambda row: row["projected_aggregate_fits_per_hour"])
         write_marker(plan, "BENCHMARK_PASSED", selected_workers=best["workers"],
                      results_sha256=sha256(root / "benchmark_results.json"),
-                     fits_per_hour=best["fits_per_hour"])
+                     fits_per_hour=best["fits_per_hour"],
+                     projected_aggregate_fits_per_hour=best["projected_aggregate_fits_per_hour"],
+                     projected_array_concurrency=best["projected_array_concurrency"],
+                     selection_criterion="projected_aggregate_fits_per_hour")
         return 0
     if phase in ("canary", "array"):
         marker(plan, "READY")

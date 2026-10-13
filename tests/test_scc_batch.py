@@ -43,7 +43,7 @@ def add_checks(plan):
     add_ready(plan)
     root = Path(plan["run_dir"])
     scc.atomic_json(root / "benchmark_results.json", {"fixture": "checked"})
-    scc.write_marker(plan, "BENCHMARK_PASSED", selected_workers=2,
+    scc.write_marker(plan, "BENCHMARK_PASSED", selected_workers=(1 if plan["resources"]["device"] == "cuda" else 2),
                      results_sha256=scc.sha256(root / "benchmark_results.json"))
     scc.atomic_json(root / "canary_audit.json", dict(plan_hash=plan["plan_hash"],
                     all_records_validated=True, files={}))
@@ -119,22 +119,28 @@ def test_formal_array_cannot_skip_prepare_benchmark_or_canary(tmp_path, monkeypa
 def test_worker_selection_rejects_tampered_benchmark(tmp_path):
     root, plan, _ = make_plan(tmp_path)
     add_checks(plan)
-    assert scc.measured_workers(plan) == 2
+    assert scc.measured_workers(plan) == 1
     scc.atomic_json(root / "benchmark_results.json", {"fixture": "changed"})
     with pytest.raises(ValueError, match="Benchmark results changed"):
         scc.measured_workers(plan)
 
 
-def test_eight_workers_per_gpu_fit_shared_gpu_cpu_slot_budget(tmp_path):
+def test_one_worker_per_gpu_is_safe_with_eight_reserved_cpu_cores(tmp_path):
     root, plan, _ = make_plan(tmp_path, cores=8, concurrency=2, cpu_slot_limit=16)
     add_checks(plan)
-    scc.write_marker(plan, "BENCHMARK_PASSED", selected_workers=8,
-                     results_sha256=scc.sha256(root / "benchmark_results.json"))
-    assert scc.measured_workers(plan) == 8
+    assert scc.benchmark_workers(plan) == [1]
+    assert scc.measured_workers(plan) == 1
     argv = scc.qsub_argv(plan, "array", "me_eight_workers")
     assert argv[argv.index("-pe")+2] == "8"
     assert argv[argv.index("-tc")+1] == "2"
     assert 8 * int(argv[argv.index("-tc")+1]) == 16
+    scc.write_marker(plan, "BENCHMARK_PASSED", selected_workers=8,
+                     results_sha256=scc.sha256(root / "benchmark_results.json"))
+    with pytest.raises(ValueError, match="unsupported worker"):
+        scc.measured_workers(plan)
+    plan["resources"]["workers"] = 2
+    with pytest.raises(ValueError, match="one worker per GPU"):
+        scc.validate_resources(plan["resources"])
 
 
 def test_duplicate_live_job_refused_but_unrelated_jobs_are_not_touched(tmp_path, monkeypatch):
@@ -259,7 +265,27 @@ def test_cpu_benchmark_gives_all_candidates_the_same_balanced_two_wave_task_mix(
         assert command[command.index("--reps")+1] == "7"
         assert command[command.index("--max-tasks")+1] == "35"
         assert command[command.index("--pilot-epochs")+1] == "20"
-    assert scc.measured_workers(plan) == 16
+    # 8 and 16 workers project the same aggregate throughput at this budget;
+    # prefer the first, smaller pool instead of the fastest individual job.
+    assert scc.measured_workers(plan) == 8
+    selected = scc.read_json(root / "BENCHMARK_PASSED.json")
+    assert selected["selection_criterion"] == "projected_aggregate_fits_per_hour"
+
+
+def test_cpu_budget_projection_can_prefer_one_worker_over_faster_eight_worker_job(tmp_path):
+    _, plan, _ = make_plan(tmp_path, device="cpu", cores=8, concurrency=8, cpu_slot_limit=8)
+    one = scc.benchmark_metrics(plan, workers=1, completed=5, elapsed_seconds=300)
+    eight = scc.benchmark_metrics(plan, workers=8, completed=5, elapsed_seconds=60)
+    assert eight["fits_per_hour"] > one["fits_per_hour"]
+    assert one["projected_aggregate_fits_per_hour"] > eight["projected_aggregate_fits_per_hour"]
+    assert one["projected_array_concurrency"] == 8
+    assert eight["projected_array_concurrency"] == 1
+    assert one["reserved_core_hours"] == pytest.approx(8*300/3600)
+    assert one["fits_per_core_hour"] == pytest.approx(5/(8*300/3600))
+    assert one["projected_formal_fits_per_core_hour"] == one["fits_per_hour"]
+    # The resource projection and scheduler use one allocation calculation.
+    assert scc.array_allocation(plan, 1) == {"cores": 1, "concurrency": 8}
+    assert scc.array_allocation(plan, 8) == {"cores": 8, "concurrency": 1}
 
 
 @pytest.mark.parametrize("interruption", ["keyboard", "SIGTERM"])

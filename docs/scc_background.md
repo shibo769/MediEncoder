@@ -48,7 +48,9 @@ The phases are:
 1. `prepare`: save one fixed mechanism and verified runtime manifest.
 2. `benchmark`: measure balanced five-method workloads with a 20-epoch cap,
    enough tasks to exercise each candidate worker count, and recorded memory
-   usage. These outputs are performance tests and cannot enter formal results.
+   usage. CPU selection maximizes projected aggregate fits/hour under the
+   configured slot budget and array-concurrency cap, rather than the speed of
+   one job. These outputs are performance tests and cannot enter formal results.
 3. `canary`: run all 30 fits for replication zero under the full training settings.
    This must pass before the formal array can be submitted.
 4. `array`: 200 elements, one replication per element, 30 paired fits per element.
@@ -72,7 +74,7 @@ RUN=/restricted/project/adsgrp/Allcodes/mediencoder_runs/cpu_example
 
 "$PY" "$CODE/scripts/scc_simulation.py" init \
   --source-dir "$CODE" --run-dir "$RUN" --python "$PY" \
-  --device cpu --cores 16 --concurrency 16 --cpu-slot-budget 128 \
+  --device cpu --cores 16 --concurrency 128 --cpu-slot-budget 128 \
   --mem-per-core-gb 4 --wall-seconds 43200
 
 "$PY" "$RUN/source/scripts/scc_simulation.py" submit --run-dir "$RUN" --phase prepare
@@ -83,6 +85,12 @@ thread. Formal elements request the selected number of cores, and the array
 concurrency is capped by both `--concurrency` and the total CPU-slot budget.
 For example, 8 selected workers and 16 simultaneous elements use up to 128 cores.
 The requested budget may spend time queued rather than being allocated at once.
+For each worker count, the tool projects single-element fits/hour multiplied by
+the number of elements that fit within both caps. A faster element using more
+cores can produce fewer fits across the whole budget. Benchmark records report
+actual reserved core-hours, fits per reserved core-hour, projected formal
+efficiency, and projected aggregate fits/hour. Queue availability is checked
+separately; these projections do not promise simultaneous allocation.
 
 ## Example GPU plan
 
@@ -91,15 +99,17 @@ RUN=/restricted/project/adsgrp/Allcodes/mediencoder_runs/gpu_example
 "$PY" "$CODE/scripts/scc_simulation.py" init \
   --source-dir "$CODE" --run-dir "$RUN" --python "$PY" \
   --device cuda --gpu-type L40S --gpu-pool shared \
-  --cores 8 --concurrency 2 --cpu-slot-budget 16 \
+  --cores 2 --concurrency 2 --cpu-slot-budget 16 \
   --gpu-memory-gb 24 --mem-per-core-gb 4 --wall-seconds 43200
 
 "$PY" "$RUN/source/scripts/scc_simulation.py" submit --run-dir "$RUN" --phase prepare
 ```
 
-This compares 1/2/4/8 workers sharing one allocated L40S. The scheduler's
-`CUDA_VISIBLE_DEVICES` is preserved. Formal concurrency is two GPUs, with the
-number of workers per GPU selected from the benchmark. Compare aggregate fits
+GPU benchmarking and formal execution use one Python worker per allocated L40S.
+Concurrent CUDA processes previously produced device-busy/unavailable errors;
+GPU sharing has not been validated, so larger worker pools are rejected. The
+scheduler's `CUDA_VISIBLE_DEVICES` is preserved. Formal concurrency is two GPUs,
+with one worker on each. Compare aggregate fits
 per hour and queue delay with the CPU plan before selecting a formal backend.
 A short-epoch benchmark is provisional; the full-setting canary provides the
 actual training and inference check.
