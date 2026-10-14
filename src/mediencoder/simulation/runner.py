@@ -287,7 +287,10 @@ def make_config(args):
         mechanism_seed=args.mechanism_seed, seed_base=args.seed_base,
         n_values=args.n, B_requested=args.reps, methods=args.arms,
         dgp=DGPConfig(p=args.p, q=args.q,
-                            alpha_upper=args.alpha_upper, delta1_spread=args.delta1_spread,
+                            alpha_upper=args.alpha_upper,
+                            treatment_link=getattr(args, "treatment_link", "linear"),
+                            sigma_U_scale=getattr(args, "sigma_u_scale", 0.05),
+                            delta1_spread=args.delta1_spread,
                             delta1_shift=args.delta1_shift, delta1_contrast=args.delta1_contrast,
                             loading_family=getattr(args, "loading_family", "polynomial"),
                             loading_strength=getattr(args, "loading_strength", 4.0),
@@ -909,6 +912,10 @@ def parse_args(argv=None):
                         help="Standardize each nuisance model's input features using only its training subset; leave Y unchanged (default disabled)")
     parser.add_argument("--alpha-upper", type=float, default=1.0,
                         help="Treatment coefficient upper bound for Uniform(0, bound), default 1")
+    parser.add_argument("--treatment-link", choices=("linear", "quadratic_centered"), default="linear",
+                        help="Treatment assignment logit: linear (default) or sum_j alpha_j * (f_Xj^2 - (mu^2 + 1/3))")
+    parser.add_argument("--sigma-u-scale", type=float, default=0.05,
+                        help="Positive scale of Sigma_U covariance eigenvalues, Uniform[1,2] times scale; not a mediator SD (default .05)")
     parser.add_argument("--delta1-spread", type=float, default=0.2,
                         help="Scale independent Uniform(.5,1.5) delta draws about 1; default .2 gives [.9,1.1]")
     parser.add_argument("--delta1-shift", type=float, default=0.0,
@@ -945,8 +952,11 @@ def parse_args(argv=None):
     parser.add_argument("--summarize-only", action="store_true")
     args = parser.parse_args(argv)
     try:
+        if not math.isfinite(args.sigma_u_scale) or args.sigma_u_scale <= 0:
+            raise ValueError("--sigma-u-scale must be finite and strictly positive")
         from mediencoder.simulation.dgp import DGPConfig
         DGPConfig(p=args.p, q=args.q, alpha_upper=args.alpha_upper,
+                  treatment_link=args.treatment_link, sigma_U_scale=args.sigma_u_scale,
                   delta1_spread=args.delta1_spread, delta1_shift=args.delta1_shift,
                   delta1_contrast=args.delta1_contrast, loading_family=args.loading_family,
                   loading_strength=args.loading_strength, loading_frequency=args.loading_frequency).validate()

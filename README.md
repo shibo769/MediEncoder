@@ -60,6 +60,24 @@ delta_0 and delta_1 are independent fixed draws with entries Uniform(0.9,1.1).
 Gaussian mediator innovations, outcome equations, and noise SDs X=2, M=1, Y=1
 are retained. This creates a new mechanism and does not resume historical results.
 
+The treatment assignment defaults to `--treatment-link linear`, using
+`e(f_X) = expit(sum_j alpha_j * f_Xj)`. The exploratory
+`--treatment-link quadratic_centered` instead uses
+`e(f_X) = expit(sum_j alpha_j * (f_Xj^2 - (mu^2 + 1/3)))`, centered by the
+population second moment of each Uniform(mu-1,mu+1) covariate factor.
+`--sigma-u-scale` controls the scale of the mediator-innovation covariance
+matrix `Sigma_U`: its eigenvalues are fixed Uniform[1,2] draws multiplied by
+this positive scale (default 0.05). It is a covariance scale, not a mediator
+standard deviation. Both settings apply to the same data-generating mechanism
+for every method and are recorded inside the manifest's `dgp` configuration;
+the default linear link is omitted from serialization to preserve the default
+canonical configuration. The causal outcome equations and analytic truth
+formula remain unchanged. These are exploratory settings requiring a separate
+run and source snapshot; existing runs retain their frozen settings and code.
+For mixed/Haar measurement maps, changing the assignment or mediator covariance
+also changes the independent mediator-pilot distribution used for calibration;
+the loading seeds remain fixed, and every method uses the same resulting map.
+
 MediEncoder defaults to fixed weights (.45,.45,.10), with ablation weights
 (.5,.5,0). Explicit --lambda-mode grid retains the former 36/9 candidate searches.
 The alignment term compares each mediator code and predicted code after dividing

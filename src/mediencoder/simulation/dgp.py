@@ -6,6 +6,11 @@ coefficients, alpha in [0, 1], and independently drawn delta matrices in
 artifacts retain their original family, numerical arrays, and content hash.
 No estimation observations are used to draw either loading family.
 
+Treatment uses the original linear logit unless quadratic_centered is explicitly
+requested. That exploratory link centers squared latent covariates by their
+population moment, never by the sampled observations. The mediator/outcome
+equations and the population target formula are unchanged.
+
 Exploratory mixed_tanh/deep_tanh maps mix latent coordinates before applying
 the invertible nonlinearity t + c*tanh(t). A separate fixed latent pilot sets
 their affine input scaling and matches each observed signal coordinate's mean
@@ -33,6 +38,7 @@ SCHEMA_VERSION = 3
 SUPPORT_RULE = "independent-fixed-latent-pilot-minmax"
 NONLINEAR_LOADING_FAMILIES = ("mixed_tanh", "deep_tanh")
 LOADING_FAMILIES = ("polynomial", "haar", *NONLINEAR_LOADING_FAMILIES)
+TREATMENT_LINKS = ("linear", "quadratic_centered")
 
 
 @dataclass(frozen=True)
@@ -59,6 +65,7 @@ class DGPConfig:
     loading_family: str = "polynomial"
     loading_strength: float = 4.0
     loading_frequency: float = 1.0
+    treatment_link: str = "linear"
 
     def to_dict(self) -> dict[str, Any]:
         """Keep pre-existing families' serialized configurations unchanged."""
@@ -68,11 +75,15 @@ class DGPConfig:
         if (self.loading_family not in NONLINEAR_LOADING_FAMILIES
                 or self.loading_frequency == 1.0):
             config.pop("loading_frequency")
+        if self.treatment_link == "linear":
+            config.pop("treatment_link")
         return config
 
     def validate(self) -> None:
         if self.loading_family not in LOADING_FAMILIES:
             raise ValueError(f"loading_family must be one of {LOADING_FAMILIES}")
+        if self.treatment_link not in TREATMENT_LINKS:
+            raise ValueError(f"treatment_link must be one of {TREATMENT_LINKS}")
         for name in ("p", "q", "bar_p", "bar_q", "L", "pilot_size"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
@@ -179,7 +190,11 @@ def _sample_latent(params: Mechanism, n: int, seed: int) -> dict[str, np.ndarray
     c, a = params.config, params.arrays
     rng = [np.random.default_rng(s) for s in _stream_seeds(seed, 0x4C415445, 6)]
     f_X = rng[0].uniform(-1, 1, size=(n, c.bar_p)) + c.mu
-    e = expit(f_X @ a["alpha"])
+    if c.treatment_link == "linear":
+        # Retain the original arithmetic and stream consumption exactly.
+        e = expit(f_X @ a["alpha"])
+    else:
+        e = expit((f_X ** 2 - (c.mu ** 2 + 1 / 3)) @ a["alpha"])
     A = (rng[1].random(n) < e).astype(np.int64)
     mean_0 = (f_X ** 2) @ a["delta_0"].T
     mean_1 = (f_X ** 2) @ a["delta_1"].T
@@ -260,6 +275,14 @@ def draw_parameters(config: DGPConfig | dict[str, Any] | None = None,
                                        "delta1_contrast": c.delta1_contrast},
                 "generator": "numpy.PCG64", "numpy_version_at_creation": np.__version__,
                 "design_note": "Fixed independent parameter and loading streams; no estimation-data calibration."}
+    if c.treatment_link != "linear":
+        metadata["treatment_assignment"] = {
+            "link": c.treatment_link,
+            "formula": "expit(sum_j alpha[j]*(f_X[j]**2 - (mu**2 + 1/3)))",
+            "centering_rule": "population-second-moment-independent-of-sampled-data",
+            "population_second_moment": c.mu ** 2 + 1 / 3,
+            "latent_coordinate_distribution": "independent-Uniform(mu-1,mu+1)",
+        }
     if c.delta1_contrast != 0 and c.delta1_shift != 0:
         metadata["delta_distribution"]["contrast_shift_rule"] = "add-after-centered-contrast"
     if c.loading_family == "polynomial":

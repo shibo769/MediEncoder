@@ -104,6 +104,7 @@ def test_legacy_serialized_configs_and_draws_ignore_new_inactive_strength(family
     expected = asdict(config)
     expected.pop("loading_strength")
     expected.pop("loading_frequency")
+    expected.pop("treatment_link")
     assert config.to_dict() == expected
     original = dgp.draw_parameters(config, 1234)
     alternative = dgp.draw_parameters(replace(config, loading_strength=6.0, loading_frequency=12.0), 1234)
