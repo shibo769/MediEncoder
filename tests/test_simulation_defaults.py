@@ -24,6 +24,7 @@ def test_main_default_configuration_records_the_approved_scientific_settings(sha
     assert config["dgp"]["p"] == config["dgp"]["q"] == 500
     assert config["dgp"]["bar_p"] == config["dgp"]["bar_q"] == 5
     assert config["tilde_p"] == config["tilde_q"] == 10
+    assert config["preprocessing"] == "none"
     assert config["dgp"]["alpha_upper"] == 1.0
     assert config["dgp"]["delta1_spread"] == .2 and config["dgp"]["delta1_contrast"] == 0.0
     assert config["mechanism_seed"] == 910000 and config["seed_base"] == 20261019
@@ -51,6 +52,20 @@ def test_nonlinear_measurement_configuration_is_explicit(family, strength, share
     assert config["stop_gradient"] is False
 
 
+@pytest.mark.parametrize("family", ["mixed_tanh", "deep_tanh"])
+def test_nonlinear_frequency_and_shared_preprocessing_are_recorded(family, shared_training):
+    config = runner.make_config(runner.parse_args([
+        "--output-dir", "unused", "--loading-family", family,
+        "--loading-frequency", "4", "--preprocessing", "standardize",
+    ]))
+    assert config["dgp"]["loading_frequency"] == 4.0
+    assert config["preprocessing"] == "standardize"
+    training = runner.runtime_training_configuration(config["training"])
+    for method in config["methods"]:
+        _, _, options = runner.task_estimation_options(config, {"method": method}, training)
+        assert options["preprocessing"] == "standardize"
+
+
 @pytest.mark.parametrize("family", ["polynomial", "haar"])
 def test_legacy_measurement_configuration_omits_unused_strength(family, shared_training):
     config = runner.make_config(runner.parse_args([
@@ -58,6 +73,7 @@ def test_legacy_measurement_configuration_omits_unused_strength(family, shared_t
         "--loading-strength", "6",
     ]))
     assert "loading_strength" not in config["dgp"]
+    assert "loading_frequency" not in config["dgp"]
 
 
 def test_fixed_lambda_reaches_each_arm_without_a_tuning_grid_or_shared_config_mutation(shared_training):
@@ -88,7 +104,9 @@ def test_explicit_grid_mode_preserves_the_original_candidate_search(shared_train
     ("--lambda-fixed", ".5,.5,0"), ("--lambda-fixed-zero", ".4,.4,.2"),
     ("--lambda-fixed", "nan,.4,.6"), ("--alpha-upper", "0"),
     ("--delta1-spread", "-.2"), ("--loading-strength", "-1"),
-    ("--loading-strength", "nan"), ("--loading-strength", "inf")])
+    ("--loading-strength", "nan"), ("--loading-strength", "inf"),
+    ("--loading-frequency", "0"), ("--loading-frequency", "-1"),
+    ("--loading-frequency", "nan"), ("--loading-frequency", "inf")])
 def test_invalid_prespecified_settings_are_rejected(argument, value):
     with pytest.raises(SystemExit):
         runner.parse_args(["--output-dir", "unused", argument + "=" + value])

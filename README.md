@@ -71,11 +71,16 @@ rejects an incompatible Haar import. Existing run manifests retain their source
 fingerprints and must be resumed with their original code snapshot.
 
 Exploratory `--loading-family mixed_tanh` and `--loading-family deep_tanh`
-replace the measurement maps with injective mixtures using `t + c*tanh(t)`;
-`--loading-strength` sets c. A fixed independent latent pilot matches each
+replace the measurement maps with injective mixtures using `t + c*tanh(w*t)`;
+`--loading-strength` sets c and `--loading-frequency` sets positive w. A fixed independent latent pilot matches each
 signal coordinate's mean and variance to the polynomial reference. The causal
 equations, measurement-noise SDs, and population target remain unchanged.
 These opt-in settings are exploratory and do not replace the polynomial default.
+`--preprocessing standardize` applies the existing representation-input
+standardization to every method, fitting means and SDs only on that method's
+representation-training rows. It preserves the loss formula and weights but
+changes its input units, so it defines a separate scientific setting. The default
+is `--preprocessing none`.
 
 Start with a small execution check:
 

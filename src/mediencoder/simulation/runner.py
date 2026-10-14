@@ -285,8 +285,10 @@ def make_config(args):
                             alpha_upper=args.alpha_upper, delta1_spread=args.delta1_spread,
                             delta1_shift=args.delta1_shift, delta1_contrast=args.delta1_contrast,
                             loading_family=getattr(args, "loading_family", "polynomial"),
-                            loading_strength=getattr(args, "loading_strength", 4.0)).to_dict(),
+                            loading_strength=getattr(args, "loading_strength", 4.0),
+                            loading_frequency=getattr(args, "loading_frequency", 1.0)).to_dict(),
         tilde_p=10, tilde_q=10,
+        preprocessing=getattr(args, "preprocessing", "none"),
         training=training,
         lambda_mode=mode, lambda_grid=tune, lambda_grid_zero=zero,
         stop_gradient=False, loss_normalization="alignment_row_l2",
@@ -651,6 +653,7 @@ def cached_observed_data(mechanism, task, config, output_dir, observed_data_from
 def task_estimation_options(config, task, training):
     """Resolve an arm's fixed weights or tuning grid without mutating the manifest."""
     options = {name: dict(settings) for name, settings in training.items()}
+    options["preprocessing"] = config.get("preprocessing", "none")
     method = "mediencoder" if task["method"] == "mediencoder_l3zero" else task["method"]
     grid = None
     if method == "mediencoder":
@@ -884,6 +887,10 @@ def parse_args(argv=None):
                         help="Fixed measurement family; polynomial is the retained default")
     parser.add_argument("--loading-strength", type=float, default=4.0,
                         help="Nonlinearity strength for mixed_tanh/deep_tanh; ignored by legacy families")
+    parser.add_argument("--loading-frequency", type=float, default=1.0,
+                        help="Positive tanh input frequency for nonlinear measurement families")
+    parser.add_argument("--preprocessing", choices=("none", "standardize"), default="none",
+                        help="Shared representation-input preprocessing, fitted only on representation-training rows")
     parser.add_argument("--alpha-upper", type=float, default=1.0,
                         help="Treatment coefficient upper bound for Uniform(0, bound), default 1")
     parser.add_argument("--delta1-spread", type=float, default=0.2,
@@ -926,7 +933,7 @@ def parse_args(argv=None):
         DGPConfig(p=args.p, q=args.q, alpha_upper=args.alpha_upper,
                   delta1_spread=args.delta1_spread, delta1_shift=args.delta1_shift,
                   delta1_contrast=args.delta1_contrast, loading_family=args.loading_family,
-                  loading_strength=args.loading_strength).validate()
+                  loading_strength=args.loading_strength, loading_frequency=args.loading_frequency).validate()
         validate_weight_decay(args.weight_decay)
         for name in ("lambda_fixed", "lambda_fixed_zero"):
             value = getattr(args, name)

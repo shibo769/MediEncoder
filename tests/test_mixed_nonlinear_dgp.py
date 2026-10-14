@@ -103,14 +103,16 @@ def test_legacy_serialized_configs_and_draws_ignore_new_inactive_strength(family
     config = dgp.DGPConfig(p=7, q=6, bar_p=2, bar_q=2, pilot_size=64, loading_family=family)
     expected = asdict(config)
     expected.pop("loading_strength")
+    expected.pop("loading_frequency")
     assert config.to_dict() == expected
     original = dgp.draw_parameters(config, 1234)
-    alternative = dgp.draw_parameters(replace(config, loading_strength=6.0), 1234)
+    alternative = dgp.draw_parameters(replace(config, loading_strength=6.0, loading_frequency=12.0), 1234)
     assert original.mechanism_hash == alternative.mechanism_hash
     assert original.serialized_config() == expected
     for schema_version in (1, 2, 3):
         serialized = replace(original, schema_version=schema_version).serialized_config()
         assert "loading_strength" not in serialized
+        assert "loading_frequency" not in serialized
         assert ("alpha_upper" in serialized) == (schema_version >= 3)
         assert ("loading_family" in serialized) == (schema_version >= 2)
     for key in original.arrays:
@@ -142,3 +144,64 @@ def test_injective_map_dimension_pilot_and_reference_variance_guards():
             config.validate()
     with pytest.raises(ValueError, match="Degenerate"):
         dgp._positive_pilot_scale(np.ones((3, 2)), "test")
+
+
+@pytest.mark.parametrize("family", dgp.NONLINEAR_LOADING_FAMILIES)
+def test_frequency_one_preserves_original_formula_payload_and_map(mechanisms, family):
+    mechanism = mechanisms[family, 2.0]
+    assert mechanism.config.loading_frequency == 1.0
+    assert "loading_frequency" not in mechanism.config.to_dict()
+    assert "loading_frequency" not in mechanism.metadata
+    assert mechanism.metadata["nonlinearity"] == "h_c(t) = t + c*tanh(t)"
+    factors = np.array([[-.2, .4], [.9, -.1]])
+    for label in ("X", "M"):
+        np.testing.assert_array_equal(
+            dgp._mixed_loading(factors, mechanism.arrays, label, 2.0),
+            dgp._mixed_loading(factors, mechanism.arrays, label, 2.0, frequency=1.0))
+    values = np.linspace(-4, 4, 101)
+    np.testing.assert_array_equal(dgp._mixed_nonlinearity(values, 2.0),
+                                  values + 2.0 * np.tanh(values))
+
+
+@pytest.mark.parametrize("family", dgp.NONLINEAR_LOADING_FAMILIES)
+def test_frequency_is_recorded_calibrated_and_reproducible(mechanisms, family, tmp_path):
+    original = mechanisms[family, 2.0]
+    altered = dgp.draw_parameters(replace(original.config, loading_frequency=4.0),
+                                  original.parameter_seed)
+    assert altered.config.to_dict()["loading_frequency"] == 4.0
+    assert altered.metadata["loading_frequency"] == 4.0
+    assert altered.mechanism_hash != original.mechanism_hash
+    assert altered.truth == original.truth
+    pilot = dgp._sample_latent(altered, altered.config.pilot_size, altered.metadata["pilot_seed"])
+    for label in ("X", "M"):
+        for suffix in ("weight1", "bias1", "weight2", "bias2", "input_mean", "input_scale"):
+            key = f"mixed_{label}_{suffix}"
+            if key in original.arrays:
+                np.testing.assert_array_equal(original.arrays[key], altered.arrays[key])
+        actual = dgp._mixed_loading(pilot[f"f_{label}"], altered.arrays, label, 2.0, frequency=4.0)
+        reference = dgp._polynomial_loading(pilot[f"f_{label}"], altered.arrays[f"polynomial_reference_{label}"])
+        np.testing.assert_allclose(actual.mean(axis=0), reference.mean(axis=0), rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(actual.std(axis=0), reference.std(axis=0), rtol=1e-12, atol=1e-12)
+    prefix = tmp_path / "frequency"
+    dgp.save_mechanism(altered, prefix)
+    restored = dgp.load_mechanism(prefix)
+    assert restored.mechanism_hash == altered.mechanism_hash
+    for name in ("X", "M", "A", "Y"):
+        np.testing.assert_array_equal(dgp.sample_data(altered, 13, 77)[name],
+                                      dgp.sample_data(restored, 13, 77)[name])
+
+
+@pytest.mark.parametrize("frequency", (1.0, 4.0, 12.0))
+def test_frequency_changes_curvature_without_losing_scalar_injectivity(frequency):
+    values = np.linspace(-5, 5, 401)
+    actual = dgp._mixed_nonlinearity(values, 6.0, frequency)
+    assert np.all(np.diff(actual) >= np.diff(values) - 1e-13)
+    np.testing.assert_array_equal(dgp._mixed_nonlinearity(values, 0.0, frequency), values)
+
+
+@pytest.mark.parametrize("frequency", (0, -1, float("nan"), float("inf"), True))
+def test_invalid_frequency_is_rejected(frequency):
+    with pytest.raises(ValueError, match="loading_frequency"):
+        dgp.DGPConfig(loading_family="mixed_tanh", loading_frequency=frequency).validate()
+    with pytest.raises(ValueError, match="loading_frequency"):
+        dgp._mixed_nonlinearity(np.ones((2, 3)), 2.0, frequency)

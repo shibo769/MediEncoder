@@ -58,12 +58,16 @@ class DGPConfig:
     pilot_size: int = 4096
     loading_family: str = "polynomial"
     loading_strength: float = 4.0
+    loading_frequency: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         """Keep pre-existing families' serialized configurations unchanged."""
         config = asdict(self)
         if self.loading_family not in NONLINEAR_LOADING_FAMILIES:
             config.pop("loading_strength")
+        if (self.loading_family not in NONLINEAR_LOADING_FAMILIES
+                or self.loading_frequency == 1.0):
+            config.pop("loading_frequency")
         return config
 
     def validate(self) -> None:
@@ -93,6 +97,9 @@ class DGPConfig:
         if (isinstance(self.loading_strength, (bool, np.bool_))
                 or not np.isfinite(self.loading_strength) or self.loading_strength < 0):
             raise ValueError("loading_strength must be finite and nonnegative")
+        if (isinstance(self.loading_frequency, (bool, np.bool_))
+                or not np.isfinite(self.loading_frequency) or self.loading_frequency <= 0):
+            raise ValueError("loading_frequency must be finite and positive")
         if self.loading_family in NONLINEAR_LOADING_FAMILIES:
             if self.p < self.bar_p or self.q < self.bar_q:
                 raise ValueError("Injective mixed maps require observed dimensions >= latent dimensions")
@@ -236,6 +243,8 @@ def draw_parameters(config: DGPConfig | dict[str, Any] | None = None,
         v = rng.normal(size=(d, d))
         v -= v.mean(axis=1, keepdims=True)
         delta_1 = delta_0 + c.delta1_contrast * v
+        if c.delta1_shift != 0:
+            delta_1 = delta_1 + c.delta1_shift
     arrays.update(delta_0=delta_0, delta_1=delta_1)
     Q, _ = np.linalg.qr(rng.normal(size=(d, d)))
     eigenvalues = rng.uniform(1, 2, size=d) * c.sigma_U_scale
@@ -251,6 +260,8 @@ def draw_parameters(config: DGPConfig | dict[str, Any] | None = None,
                                        "delta1_contrast": c.delta1_contrast},
                 "generator": "numpy.PCG64", "numpy_version_at_creation": np.__version__,
                 "design_note": "Fixed independent parameter and loading streams; no estimation-data calibration."}
+    if c.delta1_contrast != 0 and c.delta1_shift != 0:
+        metadata["delta_distribution"]["contrast_shift_rule"] = "add-after-centered-contrast"
     if c.loading_family == "polynomial":
         loading_X_seed, loading_M_seed = _stream_seeds(loading_seed, 0x504F4C59, 2)
         arrays.update(
@@ -362,12 +373,18 @@ def _polynomial_loading(factors: np.ndarray, coefficients: np.ndarray) -> np.nda
     return result
 
 
-def _mixed_nonlinearity(values: np.ndarray, strength: float) -> np.ndarray:
-    """Globally invertible scalar map, with derivative between 1 and 1+c."""
+def _mixed_nonlinearity(values: np.ndarray, strength: float,
+                        frequency: float = 1.0) -> np.ndarray:
+    """Globally invertible map, with derivative between 1 and 1+c*frequency."""
     if (isinstance(strength, (bool, np.bool_))
             or not np.isfinite(strength) or strength < 0):
         raise ValueError("loading_strength must be finite and nonnegative")
-    return values + strength * np.tanh(values)
+    if (isinstance(frequency, (bool, np.bool_))
+            or not np.isfinite(frequency) or frequency <= 0):
+        raise ValueError("loading_frequency must be finite and positive")
+    # Preserve the exact original operations at frequency one.
+    argument = values if frequency == 1.0 else frequency * values
+    return values + strength * np.tanh(argument)
 
 
 def _column_isometry(rng: np.random.Generator, rows: int, columns: int) -> np.ndarray:
@@ -388,16 +405,17 @@ def _positive_pilot_scale(values: np.ndarray, label: str) -> np.ndarray:
 
 
 def _mixed_loading(factors: np.ndarray, arrays: dict[str, np.ndarray],
-                   label: str, strength: float, *, calibrated: bool = True) -> np.ndarray:
+                   label: str, strength: float, *, calibrated: bool = True,
+                   frequency: float = 1.0) -> np.ndarray:
     """Apply only stored affine maps/nonlinearities, never recalibrate on data."""
     prefix = f"mixed_{label}_"
     standardized = (factors - arrays[prefix + "input_mean"]) / arrays[prefix + "input_scale"]
     result = _mixed_nonlinearity(standardized @ arrays[prefix + "weight1"].T
-                                 + arrays[prefix + "bias1"], strength)
+                                 + arrays[prefix + "bias1"], strength, frequency)
     if prefix + "weight2" in arrays:
         result = (result - arrays[prefix + "hidden_mean"]) / arrays[prefix + "hidden_scale"]
         result = _mixed_nonlinearity(result @ arrays[prefix + "weight2"].T
-                                     + arrays[prefix + "bias2"], strength)
+                                     + arrays[prefix + "bias2"], strength, frequency)
     if calibrated:
         result = (arrays[prefix + "reference_mean"]
                   + (result - arrays[prefix + "raw_mean"]) * arrays[prefix + "output_scale"])
@@ -443,12 +461,14 @@ def _draw_mixed_loadings(config: DGPConfig, parameter_seed: int,
         if config.loading_family == "deep_tanh":
             standardized = (factors - arrays[prefix + "input_mean"]) / arrays[prefix + "input_scale"]
             hidden = _mixed_nonlinearity(standardized @ arrays[prefix + "weight1"].T
-                                         + arrays[prefix + "bias1"], config.loading_strength)
+                                         + arrays[prefix + "bias1"], config.loading_strength,
+                                         config.loading_frequency)
             arrays[prefix + "hidden_mean"] = hidden.mean(axis=0)
             arrays[prefix + "hidden_scale"] = _positive_pilot_scale(hidden, label + " hidden")
             arrays[prefix + "weight2"] = _column_isometry(rng, dimension, first_width)
             arrays[prefix + "bias2"] = rng.uniform(-0.75, 0.75, size=dimension)
-        raw = _mixed_loading(factors, arrays, label, config.loading_strength, calibrated=False)
+        raw = _mixed_loading(factors, arrays, label, config.loading_strength, calibrated=False,
+                             frequency=config.loading_frequency)
         arrays[prefix + "raw_mean"] = raw.mean(axis=0)
         arrays[prefix + "output_scale"] = reference_scale / _positive_pilot_scale(raw, label + " map")
 
@@ -461,6 +481,9 @@ def _draw_mixed_loadings(config: DGPConfig, parameter_seed: int,
         injectivity="full-column-rank mixing, positive affine scales, h_c derivative >= 1",
         inactive_config_fields=["L", "r_min", "r_max"],
         exploration_note="Prespecified nonlinear measurement stress test; not a confirmatory method comparison.")
+    if config.loading_frequency != 1.0:
+        metadata["loading_frequency"] = config.loading_frequency
+        metadata["nonlinearity"] = "h_c,k(t) = t + c*tanh(k*t)"
 
 
 def sample_data(params: Mechanism, n: int, data_seed: int) -> dict[str, Any]:
@@ -484,8 +507,10 @@ def sample_data(params: Mechanism, n: int, data_seed: int) -> dict[str, Any]:
         X = _loading(latent["f_X"], a["Lambda_X_coef"], a["r_list"], a["s_list"])
         M = _loading(latent["f_M"], a["Lambda_M_coef"], a["r_list"], a["s_list"])
     elif c.loading_family in NONLINEAR_LOADING_FAMILIES:
-        X = _mixed_loading(latent["f_X"], a, "X", c.loading_strength)
-        M = _mixed_loading(latent["f_M"], a, "M", c.loading_strength)
+        X = _mixed_loading(latent["f_X"], a, "X", c.loading_strength,
+                           frequency=c.loading_frequency)
+        M = _mixed_loading(latent["f_M"], a, "M", c.loading_strength,
+                           frequency=c.loading_frequency)
     else:
         raise ValueError(f"Unsupported loading family: {c.loading_family}")
     X += np.random.default_rng(noise_seeds[0]).normal(0, c.sigma_eps_X, (n, c.p))

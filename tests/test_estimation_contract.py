@@ -117,11 +117,13 @@ class EstimationContractTests(unittest.TestCase):
         model = trainer.MediEncoder(4, 3, 2, 2, (4,), (4,), (4,), activation="tanh")
         output = model(torch.randn(6, 4), torch.randn(6, 3), torch.arange(6) % 2)
         trainer._alignment_loss(output["z_M"], output["z_M_pred"]).backward()
-        self.assertTrue(all(p.grad is None for p in model.encoder_M.parameters()))
-        self.assertTrue(all(p.grad is None for p in model.decoder_M.parameters()))
-        for network in (model.encoder_X, model.g_XM):
+        for decoder in (model.decoder_X, model.decoder_M):
+            self.assertTrue(all(p.grad is None for p in decoder.parameters()))
+        for network in (model.encoder_X, model.encoder_M, model.g_XM):
             self.assertGreater(sum(p.grad.abs().sum().item() for p in network.parameters()
                                    if p.grad is not None), 0.)
+            self.assertTrue(all(p.grad is None or torch.isfinite(p.grad).all()
+                                for p in network.parameters()))
 
     def test_candidate_failures_remain_auditable(self):
         X, M = np.ones((8, 2)), np.ones((8, 2))

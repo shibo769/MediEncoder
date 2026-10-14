@@ -10,6 +10,12 @@ polynomial signal means and variances. Legacy polynomial/Haar configuration
 payloads retain their hashes. Validation for this update runs on allocated SCC
 compute nodes; the historical checks below do not validate these new changes.
 
+Subsequent exploratory options expose the tanh input frequency and the existing
+shared representation-input standardization in the simulation CLI. A nonzero
+mediator contrast now retains the specified common treatment shift; shift-zero
+mechanisms retain their previous numerical values. These options require their
+own SCC validation and must not be represented as tests of the earlier snapshot.
+
 ## October 13, 2026 synchronized experiment configuration
 
 The main defaults now use p=q=500, alpha Uniform(0,1), independent delta_0/delta_1
