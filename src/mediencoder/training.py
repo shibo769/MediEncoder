@@ -466,7 +466,7 @@ def _validate_coupled_inputs(X_train, M_train):
 # ============================================================
 
 def _alignment_loss(z_M, z_M_pred):
-    """Compare each subject's code direction, retaining the detached target.
+    """Compare each subject's code direction, differentiating both branches.
 
     Each branch is divided by its own L2 norm across latent coordinates, with
     the norm clamped below by ALIGNMENT_NORM_EPS. For nonzero rows above this
@@ -474,7 +474,7 @@ def _alignment_loss(z_M, z_M_pred):
     leaves the loss unchanged. Magnitudes are not constrained by alignment.
     """
     target = nn.functional.normalize(
-        z_M.detach(), p=2, dim=1, eps=ALIGNMENT_NORM_EPS
+        z_M, p=2, dim=1, eps=ALIGNMENT_NORM_EPS
     )
     prediction = nn.functional.normalize(
         z_M_pred, p=2, dim=1, eps=ALIGNMENT_NORM_EPS
@@ -528,10 +528,11 @@ def train_mediencoder(
     Objective:
         lambda1 * mse(X_recon, X)
       + lambda2 * mse(M_recon, M)
-      + lambda3 * mse(row_unit(stop_gradient(z_M)), row_unit(z_M_pred))
+      + lambda3 * mse(row_unit(z_M), row_unit(z_M_pred))
 
     Each MSE averages over subjects and coordinates; lambda weights sum to one.
     row_unit divides each row by max(its L2 norm, ALIGNMENT_NORM_EPS).
+    Alignment gradients update both encoders and the cross-factor predictor.
 
     If validation data are supplied, choose the checkpoint using weighted
     reconstruction loss only, without variance divisors.
@@ -667,11 +668,9 @@ def train_mediencoder(
 
             raw_loss_X = mse_fn(X_recon, xb)
             raw_loss_M = mse_fn(M_recon, mb)
-            # Detach alignment TARGET z_M: lambda3 trains g_XM (and encoder_X via z_X)
-            # to PREDICT the mediator code, not drag encoder_M's code down to be
-            # predictable. Without detach the gradient collapses z_M's scale
-            # (std ~0.2 vs ~2.7), destroying the arm-difference and the NIE.
-            raw_loss_align = mse_fn(z_M.detach(), z_M_pred)
+            # The raw MSE is diagnostic only. The normalized objective below
+            # retains gradients through both z_M and z_M_pred.
+            raw_loss_align = mse_fn(z_M.detach(), z_M_pred.detach())
 
             loss_X = raw_loss_X
             loss_M = raw_loss_M
@@ -778,7 +777,7 @@ def train_mediencoder(
         model.load_state_dict(best_state)
 
     fit_info = {
-        "alignment_stop_gradient": True,
+        "alignment_stop_gradient": False,
         "loss_normalization": "alignment_row_l2",
         "reconstruction_loss_normalization": "none",
         "alignment_normalization": ALIGNMENT_NORMALIZATION,
@@ -915,11 +914,12 @@ def train_mediencoder_vae(
     Objective:
         lambda1 * mse(X_recon, X)
       + lambda2 * mse(M_recon, M)
-      + lambda3 * mse(row_unit(stop_gradient(z_M)), row_unit(z_M_pred))
+      + lambda3 * mse(row_unit(z_M), row_unit(z_M_pred))
       + beta_kl * (KL_X + KL_M)
 
     row_unit divides each row by max(its L2 norm, ALIGNMENT_NORM_EPS).
     Reconstruction MSE is unnormalized; lambda weights sum to one.
+    Alignment gradients pass through both sampled codes and their encoders.
     """
 
     if allow_unbalanced_lambda:
@@ -1051,7 +1051,9 @@ def train_mediencoder_vae(
 
             raw_loss_X = mse_fn(out["X_recon"], xb)
             raw_loss_M = mse_fn(out["M_recon"], mb)
-            raw_loss_align = mse_fn(out["z_M"].detach(), out["z_M_pred"])
+            # Diagnostic raw MSE; optimization uses the two-branch normalized
+            # alignment loss below, including the mediator-encoder gradient.
+            raw_loss_align = mse_fn(out["z_M"].detach(), out["z_M_pred"].detach())
 
             kl_X = kl_divergence_standard_normal(out["mu_X"], out["logvar_X"])
             kl_M = kl_divergence_standard_normal(out["mu_M"], out["logvar_M"])
@@ -1185,7 +1187,7 @@ def train_mediencoder_vae(
         model.load_state_dict(best_state)
 
     fit_info = {
-        "alignment_stop_gradient": True,
+        "alignment_stop_gradient": False,
         "loss_normalization": "alignment_row_l2",
         "reconstruction_loss_normalization": "none",
         "alignment_normalization": ALIGNMENT_NORMALIZATION,

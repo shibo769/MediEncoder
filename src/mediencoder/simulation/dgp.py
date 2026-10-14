@@ -1,10 +1,16 @@
-"""Fixed-mechanism main simulation with additive cubic measurement loadings.
+"""Fixed-mechanism simulation with reproducible measurement-map alternatives.
 
 New mechanisms use powers one through three with independent fixed Gaussian
 coefficients, alpha in [0, 1], and independently drawn delta matrices in
 [0.9, 1.1]. Haar loadings remain an explicit legacy option; schema-1 and schema-2
 artifacts retain their original family, numerical arrays, and content hash.
 No estimation observations are used to draw either loading family.
+
+Exploratory mixed_tanh/deep_tanh maps mix latent coordinates before applying
+the invertible nonlinearity t + c*tanh(t). A separate fixed latent pilot sets
+their affine input scaling and matches each observed signal coordinate's mean
+and variance to the original cubic map. Structural equations and truth stay
+unchanged. Polynomial/Haar payloads and numerical draws remain compatible.
 
 The population target is E[Y(1,M(0))].  All polynomial moments are analytic; only
 the smooth softplus expectation uses deterministic, successively refined tensor
@@ -25,7 +31,8 @@ from scipy.special import expit
 
 SCHEMA_VERSION = 3
 SUPPORT_RULE = "independent-fixed-latent-pilot-minmax"
-LOADING_FAMILIES = ("polynomial", "haar")
+NONLINEAR_LOADING_FAMILIES = ("mixed_tanh", "deep_tanh")
+LOADING_FAMILIES = ("polynomial", "haar", *NONLINEAR_LOADING_FAMILIES)
 
 
 @dataclass(frozen=True)
@@ -50,6 +57,14 @@ class DGPConfig:
     coef_scale_M: float = 1.0
     pilot_size: int = 4096
     loading_family: str = "polynomial"
+    loading_strength: float = 4.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Keep pre-existing families' serialized configurations unchanged."""
+        config = asdict(self)
+        if self.loading_family not in NONLINEAR_LOADING_FAMILIES:
+            config.pop("loading_strength")
+        return config
 
     def validate(self) -> None:
         if self.loading_family not in LOADING_FAMILIES:
@@ -75,6 +90,16 @@ class DGPConfig:
             raise ValueError("sigma_U_scale must be positive")
         if self.alpha_upper <= 0:
             raise ValueError("alpha_upper must be positive")
+        if (isinstance(self.loading_strength, (bool, np.bool_))
+                or not np.isfinite(self.loading_strength) or self.loading_strength < 0):
+            raise ValueError("loading_strength must be finite and nonnegative")
+        if self.loading_family in NONLINEAR_LOADING_FAMILIES:
+            if self.p < self.bar_p or self.q < self.bar_q:
+                raise ValueError("Injective mixed maps require observed dimensions >= latent dimensions")
+            if self.pilot_size < 2:
+                raise ValueError("Mixed-map calibration requires at least two independent pilot subjects")
+            if self.coef_scale_X <= 0 or self.coef_scale_M <= 0:
+                raise ValueError("Injective mixed maps require positive reference coefficient scales")
 
 
 @dataclass(frozen=True)
@@ -104,7 +129,7 @@ class Mechanism:
     schema_version: int = SCHEMA_VERSION
 
     def serialized_config(self) -> dict[str, Any]:
-        config = asdict(self.config)
+        config = self.config.to_dict()
         if self.schema_version < 3:
             # Alpha's upper bound was implicit before schema 3. Do not alter
             # the payload used by existing numerical-mechanism hashes.
@@ -237,7 +262,7 @@ def draw_parameters(config: DGPConfig | dict[str, Any] | None = None,
                         polynomial_formula="sum_j sum_{r=1}^3 C[k,j,r-1]*f[j]^r",
                         loading_X_seed=loading_X_seed, loading_M_seed=loading_M_seed,
                         inactive_config_fields=["L", "r_min", "r_max", "pilot_size"])
-    else:
+    elif c.loading_family == "haar":
         provisional = Mechanism(c, parameter_seed, arrays, {})
         pilot = _sample_latent(provisional, c.pilot_size, pilot_seed)
         low = float(min(pilot["f_X"].min(), pilot["f_M"].min()))
@@ -251,6 +276,8 @@ def draw_parameters(config: DGPConfig | dict[str, Any] | None = None,
                       Lambda_M_coef=rng.normal(0, c.coef_scale_M / np.sqrt(c.L), size=(c.q, d, c.L)))
         metadata.update(support_rule=SUPPORT_RULE, pilot_size=c.pilot_size,
                         pilot_seed=pilot_seed, support_bounds=[low, high])
+    else:
+        _draw_mixed_loadings(c, parameter_seed, arrays, metadata, loading_seed, pilot_seed)
     params = Mechanism(c, parameter_seed, _freeze(arrays), metadata)
     truth = population_truth(params)
     return Mechanism(c, parameter_seed, params.arrays, metadata, truth)
@@ -335,6 +362,107 @@ def _polynomial_loading(factors: np.ndarray, coefficients: np.ndarray) -> np.nda
     return result
 
 
+def _mixed_nonlinearity(values: np.ndarray, strength: float) -> np.ndarray:
+    """Globally invertible scalar map, with derivative between 1 and 1+c."""
+    if (isinstance(strength, (bool, np.bool_))
+            or not np.isfinite(strength) or strength < 0):
+        raise ValueError("loading_strength must be finite and nonnegative")
+    return values + strength * np.tanh(values)
+
+
+def _column_isometry(rng: np.random.Generator, rows: int, columns: int) -> np.ndarray:
+    """A full-column-rank affine mixing map; rows must be at least columns."""
+    if rows < columns:
+        raise ValueError("Injective mixing requires rows >= columns")
+    q, r = np.linalg.qr(rng.normal(size=(rows, columns)), mode="reduced")
+    if np.any(np.abs(np.diag(r)) < np.finfo(float).eps):
+        raise ValueError("Numerically singular random mixing matrix")
+    return q * np.sqrt(rows / columns)
+
+
+def _positive_pilot_scale(values: np.ndarray, label: str) -> np.ndarray:
+    scale = np.std(values, axis=0)
+    if not np.isfinite(scale).all() or np.any(scale <= np.finfo(float).eps):
+        raise ValueError(f"Degenerate fixed-pilot calibration: {label}")
+    return scale
+
+
+def _mixed_loading(factors: np.ndarray, arrays: dict[str, np.ndarray],
+                   label: str, strength: float, *, calibrated: bool = True) -> np.ndarray:
+    """Apply only stored affine maps/nonlinearities, never recalibrate on data."""
+    prefix = f"mixed_{label}_"
+    standardized = (factors - arrays[prefix + "input_mean"]) / arrays[prefix + "input_scale"]
+    result = _mixed_nonlinearity(standardized @ arrays[prefix + "weight1"].T
+                                 + arrays[prefix + "bias1"], strength)
+    if prefix + "weight2" in arrays:
+        result = (result - arrays[prefix + "hidden_mean"]) / arrays[prefix + "hidden_scale"]
+        result = _mixed_nonlinearity(result @ arrays[prefix + "weight2"].T
+                                     + arrays[prefix + "bias2"], strength)
+    if calibrated:
+        result = (arrays[prefix + "reference_mean"]
+                  + (result - arrays[prefix + "raw_mean"]) * arrays[prefix + "output_scale"])
+    return result
+
+
+def _draw_mixed_loadings(config: DGPConfig, parameter_seed: int,
+                         arrays: dict[str, np.ndarray], metadata: dict[str, Any],
+                         loading_seed: int, pilot_seed: int) -> None:
+    """Prespecify mixed maps using separate parameter/pilot streams only.
+
+    Every affine mixing matrix has full column rank, every scale is positive,
+    and h_c has derivative >= 1. Their composition is therefore globally
+    injective. Matching marginal moments controls signal-to-noise scale, but
+    deliberately does not force covariance spectra to match across families.
+    """
+    provisional = Mechanism(config, parameter_seed, arrays, {})
+    pilot = _sample_latent(provisional, config.pilot_size, pilot_seed)
+    reference_seeds = _stream_seeds(loading_seed, 0x504F4C59, 2)
+    domain = 0x4D495845 if config.loading_family == "mixed_tanh" else 0x44454550
+    map_seeds = _stream_seeds(loading_seed, domain, 2)
+    hidden_widths = {}
+    for label, dimension, latent_dim, coefficient_scale, reference_seed, map_seed in (
+            ("X", config.p, config.bar_p, config.coef_scale_X, reference_seeds[0], map_seeds[0]),
+            ("M", config.q, config.bar_q, config.coef_scale_M, reference_seeds[1], map_seeds[1])):
+        prefix = f"mixed_{label}_"
+        factors = pilot[f"f_{label}"]
+        arrays[prefix + "input_mean"] = factors.mean(axis=0)
+        arrays[prefix + "input_scale"] = _positive_pilot_scale(factors, label + " latent")
+        coefficients = np.random.default_rng(reference_seed).normal(
+            0, coefficient_scale / np.sqrt(3), size=(dimension, latent_dim, 3))
+        arrays[f"polynomial_reference_{label}"] = coefficients
+        reference = _polynomial_loading(factors, coefficients)
+        arrays[prefix + "reference_mean"] = reference.mean(axis=0)
+        reference_scale = _positive_pilot_scale(reference, label + " cubic reference")
+        arrays[prefix + "reference_scale"] = reference_scale
+
+        rng = np.random.default_rng(map_seed)
+        first_width = dimension if config.loading_family == "mixed_tanh" else min(24, dimension)
+        hidden_widths[label] = first_width
+        arrays[prefix + "weight1"] = _column_isometry(rng, first_width, latent_dim)
+        arrays[prefix + "bias1"] = rng.uniform(-0.75, 0.75, size=first_width)
+        if config.loading_family == "deep_tanh":
+            standardized = (factors - arrays[prefix + "input_mean"]) / arrays[prefix + "input_scale"]
+            hidden = _mixed_nonlinearity(standardized @ arrays[prefix + "weight1"].T
+                                         + arrays[prefix + "bias1"], config.loading_strength)
+            arrays[prefix + "hidden_mean"] = hidden.mean(axis=0)
+            arrays[prefix + "hidden_scale"] = _positive_pilot_scale(hidden, label + " hidden")
+            arrays[prefix + "weight2"] = _column_isometry(rng, dimension, first_width)
+            arrays[prefix + "bias2"] = rng.uniform(-0.75, 0.75, size=dimension)
+        raw = _mixed_loading(factors, arrays, label, config.loading_strength, calibrated=False)
+        arrays[prefix + "raw_mean"] = raw.mean(axis=0)
+        arrays[prefix + "output_scale"] = reference_scale / _positive_pilot_scale(raw, label + " map")
+
+    metadata.update(
+        nonlinearity="h_c(t) = t + c*tanh(t)", loading_strength=config.loading_strength,
+        mixed_hidden_widths=hidden_widths, mixed_X_seed=map_seeds[0], mixed_M_seed=map_seeds[1],
+        reference_loading_X_seed=reference_seeds[0], reference_loading_M_seed=reference_seeds[1],
+        calibration_rule="independent-fixed-latent-pilot-per-coordinate-cubic-mean-variance",
+        pilot_size=config.pilot_size, pilot_seed=pilot_seed,
+        injectivity="full-column-rank mixing, positive affine scales, h_c derivative >= 1",
+        inactive_config_fields=["L", "r_min", "r_max"],
+        exploration_note="Prespecified nonlinear measurement stress test; not a confirmatory method comparison.")
+
+
 def sample_data(params: Mechanism, n: int, data_seed: int) -> dict[str, Any]:
     """Sample one dataset; oracle information is deliberately nested separately.
 
@@ -355,6 +483,9 @@ def sample_data(params: Mechanism, n: int, data_seed: int) -> dict[str, Any]:
     elif c.loading_family == "haar":
         X = _loading(latent["f_X"], a["Lambda_X_coef"], a["r_list"], a["s_list"])
         M = _loading(latent["f_M"], a["Lambda_M_coef"], a["r_list"], a["s_list"])
+    elif c.loading_family in NONLINEAR_LOADING_FAMILIES:
+        X = _mixed_loading(latent["f_X"], a, "X", c.loading_strength)
+        M = _mixed_loading(latent["f_M"], a, "M", c.loading_strength)
     else:
         raise ValueError(f"Unsupported loading family: {c.loading_family}")
     X += np.random.default_rng(noise_seeds[0]).normal(0, c.sigma_eps_X, (n, c.p))

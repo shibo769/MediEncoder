@@ -87,12 +87,11 @@ be selected together. Such truncation choices can affect bias and must be
 reported with the analysis; finite weights do not establish population overlap.
 
 Reconstruction losses use raw MSE. Alignment compares row-L2-normalized mediator
-and predicted codes, with target stop-gradient and epsilon 1e-8. The three
+and predicted codes, with gradients through both encoders and epsilon 1e-8. The three
 lambda weights sum to one. This does not alter the separate input-preprocessing
 option described above.
-Stop-gradient alignment and reconstruction-based checkpointing are retained;
-this release does not claim that those updates solve the ordinary joint scalar
-minimization written in older manuscript versions.
+Reconstruction-based checkpoint selection is retained. This release does not
+claim that finite gradient training attains a global objective minimum.
 
 The core first estimates `theta10 = E[Y(1, M(0))]`. With `return_effects=True`, it
 also fits, within the same nuisance folds and learned pretreatment representation,

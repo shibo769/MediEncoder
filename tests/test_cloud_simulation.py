@@ -1,5 +1,4 @@
 """Synthetic artifact integrity and inference checks; no training or network."""
-from dataclasses import asdict
 import hashlib
 import importlib.util
 import json
@@ -18,7 +17,7 @@ SPEC.loader.exec_module(cloud)
 def make_artifacts(tmp_path, *, omit_task=False, changed_pairing=False, changed_interval=False):
     params = dgp.draw_parameters(dgp.DGPConfig(p=4, q=3, bar_p=2, bar_q=2, pilot_size=64), 17)
     config = dict(B_requested=4, n_values=[40], methods=["projection", "mediencoder"],
-                  seed_base=99, device="cpu", dgp=asdict(params.config), tilde_p=2, tilde_q=2,
+                  seed_base=99, device="cpu", dgp=params.config.to_dict(), tilde_p=2, tilde_q=2,
                   run_kind="TEST_FIXTURE_NOT_FOR_PAPER")
     identity = dict(config=config, code_hashes=runner.collect_code_hashes(),
                     mechanism_hash=params.mechanism_hash, environment={"fixture": "same"})

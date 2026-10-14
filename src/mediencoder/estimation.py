@@ -1521,7 +1521,7 @@ def estimate_triply_IF(
         },
         "estimator_contract": {
             "observed_data_only": True,
-            "alignment_stop_gradient": True if factor_method in _LAMBDA_METHODS else None,
+            "alignment_stop_gradient": False if factor_method in _LAMBDA_METHODS else None,
             "coupled_loss_scales": "alignment_row_l2" if factor_method in _LAMBDA_METHODS else None,
             "reconstruction_loss_normalization": "none" if factor_method in _LAMBDA_METHODS else None,
             "alignment_normalization": ALIGNMENT_NORMALIZATION if factor_method in _LAMBDA_METHODS else None,

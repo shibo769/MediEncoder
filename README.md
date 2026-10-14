@@ -59,7 +59,8 @@ are retained. This creates a new mechanism and does not resume historical result
 MediEncoder defaults to fixed weights (.45,.45,.10), with ablation weights
 (.5,.5,0). Explicit --lambda-mode grid retains the former 36/9 candidate searches.
 The alignment term compares each mediator code and predicted code after dividing
-each row by its own L2 norm, with epsilon 1e-8. The target remains detached.
+each row by its own L2 norm, with epsilon 1e-8. Alignment gradients update both
+encoders and the cross-factor predictor; neither code is detached.
 X/M reconstruction uses raw MSE; inference still uses the original encoder
 outputs. All nuisance networks have two hidden layers of width 300.
 
@@ -68,6 +69,13 @@ generator or when importing an old Haar mechanism. Schema-1 saved mechanisms
 retain their original content hashes and loadings; a default polynomial run
 rejects an incompatible Haar import. Existing run manifests retain their source
 fingerprints and must be resumed with their original code snapshot.
+
+Exploratory `--loading-family mixed_tanh` and `--loading-family deep_tanh`
+replace the measurement maps with injective mixtures using `t + c*tanh(t)`;
+`--loading-strength` sets c. A fixed independent latent pilot matches each
+signal coordinate's mean and variance to the polynomial reference. The causal
+equations, measurement-noise SDs, and population target remain unchanged.
+These opt-in settings are exploratory and do not replace the polynomial default.
 
 Start with a small execution check:
 
@@ -156,8 +164,8 @@ They remain asymptotic intervals and depend on identification, overlap,
 representation, and nuisance-estimation assumptions. Passing software tests does
 not establish these assumptions or guarantee nominal coverage.
 
-The mediator alignment target intentionally uses stop-gradient and row-L2 normalization; checkpoint
-selection uses reconstruction loss. The implementation is not asserted to solve
-an unconstrained joint scalar-objective argmin. These corrections do not revise
+Alignment uses row-L2 normalization and propagates through both encoders;
+checkpoint selection still uses reconstruction loss. Finite gradient training
+is not asserted to attain a global scalar-objective minimum. These changes do not revise
 or certify any manuscript proof. Historical tables must be recomputed; this code
 release does not validate their reported numbers.

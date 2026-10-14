@@ -34,7 +34,30 @@ def test_main_default_configuration_records_the_approved_scientific_settings(sha
     assert all(config["training"][name]["weight_decay"] == 0.0
                for name in ("nn_cfg", "ae_cfg", "me_cfg"))
     assert config["alignment_normalization"] == "row_l2" and config["alignment_norm_eps"] == 1e-8
-    assert config["reconstruction_loss_normalization"] == "none" and config["stop_gradient"] is True
+    assert config["reconstruction_loss_normalization"] == "none" and config["stop_gradient"] is False
+
+
+@pytest.mark.parametrize("family", ["mixed_tanh", "deep_tanh"])
+@pytest.mark.parametrize("strength", [2.0, 6.0])
+def test_nonlinear_measurement_configuration_is_explicit(family, strength, shared_training):
+    config = runner.make_config(runner.parse_args([
+        "--output-dir", "unused", "--loading-family", family,
+        "--loading-strength", str(strength),
+    ]))
+    assert config["dgp"]["loading_family"] == family
+    assert config["dgp"]["loading_strength"] == strength
+    assert config["alignment_normalization"] == "row_l2"
+    assert config["lambda_grid"] == [[.45, .45, .10]]
+    assert config["stop_gradient"] is False
+
+
+@pytest.mark.parametrize("family", ["polynomial", "haar"])
+def test_legacy_measurement_configuration_omits_unused_strength(family, shared_training):
+    config = runner.make_config(runner.parse_args([
+        "--output-dir", "unused", "--loading-family", family,
+        "--loading-strength", "6",
+    ]))
+    assert "loading_strength" not in config["dgp"]
 
 
 def test_fixed_lambda_reaches_each_arm_without_a_tuning_grid_or_shared_config_mutation(shared_training):
@@ -64,7 +87,8 @@ def test_explicit_grid_mode_preserves_the_original_candidate_search(shared_train
 @pytest.mark.parametrize("argument,value", [("--lambda-fixed", ".4,.4,.4"),
     ("--lambda-fixed", ".5,.5,0"), ("--lambda-fixed-zero", ".4,.4,.2"),
     ("--lambda-fixed", "nan,.4,.6"), ("--alpha-upper", "0"),
-    ("--delta1-spread", "-.2")])
+    ("--delta1-spread", "-.2"), ("--loading-strength", "-1"),
+    ("--loading-strength", "nan"), ("--loading-strength", "inf")])
 def test_invalid_prespecified_settings_are_rejected(argument, value):
     with pytest.raises(SystemExit):
         runner.parse_args(["--output-dir", "unused", argument + "=" + value])

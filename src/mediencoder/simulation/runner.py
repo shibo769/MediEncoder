@@ -266,7 +266,6 @@ def training_configuration(epochs, weight_decay=0.0):
 def make_config(args):
     from mediencoder.simulation.dgp import DGPConfig
     from mediencoder.training import ALIGNMENT_NORMALIZATION, ALIGNMENT_NORM_EPS
-    from dataclasses import asdict
     mode = getattr(args, "lambda_mode", "fixed")
     tune, zero = (lambda_grids() if mode == "grid" else
                   ([list(args.lambda_fixed)], [list(args.lambda_fixed_zero)]))
@@ -282,14 +281,15 @@ def make_config(args):
         estimand="population E[mu10(f_X)] conditional on fixed mechanism",
         mechanism_seed=args.mechanism_seed, seed_base=args.seed_base,
         n_values=args.n, B_requested=args.reps, methods=args.arms,
-        dgp=asdict(DGPConfig(p=args.p, q=args.q,
+        dgp=DGPConfig(p=args.p, q=args.q,
                             alpha_upper=args.alpha_upper, delta1_spread=args.delta1_spread,
                             delta1_shift=args.delta1_shift, delta1_contrast=args.delta1_contrast,
-                            loading_family=getattr(args, "loading_family", "polynomial"))),
+                            loading_family=getattr(args, "loading_family", "polynomial"),
+                            loading_strength=getattr(args, "loading_strength", 4.0)).to_dict(),
         tilde_p=10, tilde_q=10,
         training=training,
         lambda_mode=mode, lambda_grid=tune, lambda_grid_zero=zero,
-        stop_gradient=True, loss_normalization="alignment_row_l2",
+        stop_gradient=False, loss_normalization="alignment_row_l2",
         reconstruction_loss_normalization="none", alignment_normalization=ALIGNMENT_NORMALIZATION,
         alignment_norm_eps=ALIGNMENT_NORM_EPS,
         loss_reduction="mean_over_subjects_and_coordinates",
@@ -385,8 +385,7 @@ def mechanism_prefix(path):
 
 
 def validate_mechanism_config(mechanism, config):
-    from dataclasses import asdict
-    if canonical_json(asdict(mechanism.config)) != canonical_json(config["dgp"]):
+    if canonical_json(mechanism.config.to_dict()) != canonical_json(config["dgp"]):
         raise ValueError("Imported/saved mechanism DGP configuration differs from this run")
     if mechanism.parameter_seed != config["mechanism_seed"]:
         raise ValueError("Imported/saved mechanism parameter seed differs from --mechanism-seed")
@@ -880,8 +879,11 @@ def parse_args(argv=None):
     parser.add_argument("--n", type=lambda s: [int(x) for x in s.split(",")], default=[100,300,800,1200,2000,3000])
     parser.add_argument("--p", type=int, default=500, help="Number of observed covariates (default 500)")
     parser.add_argument("--q", type=int, default=500, help="Number of observed mediators (default 500)")
-    parser.add_argument("--loading-family", choices=("polynomial", "haar"), default="polynomial",
-                        help="Fixed measurement maps: additive degree-3 polynomial (default), or explicit legacy Haar")
+    from mediencoder.simulation.dgp import LOADING_FAMILIES
+    parser.add_argument("--loading-family", choices=LOADING_FAMILIES, default="polynomial",
+                        help="Fixed measurement family; polynomial is the retained default")
+    parser.add_argument("--loading-strength", type=float, default=4.0,
+                        help="Nonlinearity strength for mixed_tanh/deep_tanh; ignored by legacy families")
     parser.add_argument("--alpha-upper", type=float, default=1.0,
                         help="Treatment coefficient upper bound for Uniform(0, bound), default 1")
     parser.add_argument("--delta1-spread", type=float, default=0.2,
@@ -923,7 +925,8 @@ def parse_args(argv=None):
         from mediencoder.simulation.dgp import DGPConfig
         DGPConfig(p=args.p, q=args.q, alpha_upper=args.alpha_upper,
                   delta1_spread=args.delta1_spread, delta1_shift=args.delta1_shift,
-                  delta1_contrast=args.delta1_contrast, loading_family=args.loading_family).validate()
+                  delta1_contrast=args.delta1_contrast, loading_family=args.loading_family,
+                  loading_strength=args.loading_strength).validate()
         validate_weight_decay(args.weight_decay)
         for name in ("lambda_fixed", "lambda_fixed_zero"):
             value = getattr(args, name)
@@ -990,7 +993,7 @@ def _main_locked(args):
     else:
         manifest.update(created_at=utc_now(), truth=mechanism.truth.to_dict(),
                         mechanism_provenance=mechanism_provenance,
-                        implementation_note="Paper/theory untouched. Fixed-mechanism population truth; raw reconstruction MSE; row-L2-normalized mediator alignment with stop-gradient; recorded fixed or tuned simplex lambda weights; dataset-specific within-fold IF intervals.")
+                        implementation_note="Paper/theory untouched. Fixed-mechanism population truth; raw reconstruction MSE; row-L2-normalized mediator alignment with gradients through both encoders; recorded fixed or tuned simplex lambda weights; dataset-specific within-fold IF intervals.")
         atomic_json(manifest_path, manifest)
     tasks = list(build_tasks(config))
     expected = {t["task_id"]: t for t in tasks}

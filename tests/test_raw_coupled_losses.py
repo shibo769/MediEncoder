@@ -29,6 +29,7 @@ def test_raw_training_and_validation_losses(variational, constant_inputs, weight
         lambda1=weights[0], lambda2=weights[1], lambda3=weights[2],
         allow_unbalanced_lambda=True, activation="tanh", scheduler_type="none", **kwargs)
     assert info["loss_normalization"] == "alignment_row_l2"
+    assert info["alignment_stop_gradient"] is False
     assert info["reconstruction_loss_normalization"] == "none"
     assert info["alignment_normalization"] == training.ALIGNMENT_NORMALIZATION
     assert info["alignment_norm_eps"] == training.ALIGNMENT_NORM_EPS

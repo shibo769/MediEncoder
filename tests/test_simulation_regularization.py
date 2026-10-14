@@ -1,6 +1,6 @@
 """Shared regularization and fixed-mechanism reuse, without fitting a model."""
 from copy import deepcopy
-from dataclasses import asdict, replace
+from dataclasses import replace
 import json
 
 import numpy as np
@@ -23,7 +23,7 @@ def mechanism_source(mechanism, tmp_path):
 
 
 def mechanism_config(mechanism):
-    return dict(dgp=asdict(mechanism.config), mechanism_seed=mechanism.parameter_seed)
+    return dict(dgp=mechanism.config.to_dict(), mechanism_seed=mechanism.parameter_seed)
 
 
 def test_regularization_cli_rejects_invalid_values():

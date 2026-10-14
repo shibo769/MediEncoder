@@ -42,7 +42,7 @@ conditional outcome is not substituted for the population target. Oracle values
 remain in simulation metadata and are excluded from fitting and tuning.
 
 The coupled loss is `lambda1 * MSE_X + lambda2 * MSE_M + lambda3 * MSE_align`.
-Reconstruction uses raw MSE. The alignment term compares the detached mediator
+Reconstruction uses raw MSE. The alignment term compares the mediator
 code and its prediction after each row is divided by its own L2 norm, bounded
 below by 1e-8. Positive rescaling of either nonzero row leaves this directional
 loss unchanged when its norm is above the epsilon threshold. It no longer
@@ -65,11 +65,10 @@ not an inferential standard error.
 
 ## Training and remaining scientific limitations
 
-Retained stop-gradient alignment updates the predictor of the mediator
-representation without propagating that term through the mediator target.
-Checkpoint selection uses the weighted reconstruction criterion. The code does
-not identify this procedure with solving an unconstrained joint scalar objective,
-nor establish a representation recovery rate.
+Alignment gradients update both encoders and the cross-factor predictor.
+The mediator target is no longer detached. Checkpoint selection still uses the
+weighted reconstruction criterion. Finite gradient training does not establish
+a global optimum or a representation recovery rate.
 
 The main defaults use 300 maximum epochs,
 encoder widths 300/200, cross-factor widths 50/50, nuisance widths 300/300,

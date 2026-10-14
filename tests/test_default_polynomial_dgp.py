@@ -123,7 +123,7 @@ def test_cli_default_and_explicit_legacy_import_are_unambiguous(tmp_path, monkey
     assert list(tmp_path.iterdir()) == []
     imported, _ = runner.prepare_mechanism(tmp_path, legacy, mechanism_from=source)
     assert imported.config.loading_family == "haar"
-    assert asdict(imported.config) == legacy["dgp"]
+    assert imported.config.to_dict() == legacy["dgp"]
 
 
 def test_default_structural_parameters_use_narrow_independent_delta_draws(cubic):

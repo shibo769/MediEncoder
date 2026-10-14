@@ -1,5 +1,15 @@
 # Validation of the corrected release
 
+## October 14, 2026 joint alignment and exploratory measurement maps
+
+Alignment now propagates through both encoders and the cross-factor predictor.
+The row-L2 loss, epsilon, coordinate averaging, reconstruction losses, and fixed
+lambda weights are unchanged. Opt-in injective mixed/deep tanh maps change only
+the measurement maps, with fixed independent pilot calibration to the original
+polynomial signal means and variances. Legacy polynomial/Haar configuration
+payloads retain their hashes. Validation for this update runs on allocated SCC
+compute nodes; the historical checks below do not validate these new changes.
+
 ## October 13, 2026 synchronized experiment configuration
 
 The main defaults now use p=q=500, alpha Uniform(0,1), independent delta_0/delta_1
