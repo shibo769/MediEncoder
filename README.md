@@ -54,11 +54,30 @@ Current main defaults use p=q=500, five true factors per block, and ten learned
 coordinates per block. `--latent-p` and `--latent-q` set the positive learned
 dimensions for X and M for all five methods; both default to 10 and are recorded
 as `tilde_p` and `tilde_q` in the scientific manifest. These switches do not change
-the five true factors in the data-generating mechanism.
+the true factors in the data-generating mechanism. The separate `--factor-dim`
+option sets both true dimensions, `bar_p=bar_q`, to an integer from 1 through 5
+(default 5); it does not alter either learned representation dimension. The
+existing population-theta10 quadrature supports these dimensions. A changed
+true dimension draws a different mechanism and target; it is not a controlled
+perturbation holding the old structural coefficients or population target fixed.
 Treatment coefficients are fixed draws from Uniform(0,1);
 delta_0 and delta_1 are independent fixed draws with entries Uniform(0.9,1.1).
 Gaussian mediator innovations, outcome equations, and noise SDs X=2, M=1, Y=1
 are retained. This creates a new mechanism and does not resume historical results.
+
+The existing Gaussian noise SDs can be specified with `--sigma-eps-x-sd` (default
+2), `--sigma-eps-m-sd` (default 1), and `--sigma-y-sd` (default 1). These are
+finite nonnegative **standard deviations**, with zero permitted. They map to
+`dgp.sigma_eps_X`, `dgp.sigma_eps_M`, and `dgp.sigma_y` in the manifest, separate
+from the covariance-eigenvalue scale `--sigma-u-scale`. All methods receive the
+same resulting DGP. The noise and factor-dimension fields already existed in
+the mechanism schema, so explicit default values preserve the previous canonical
+configuration and RNG behavior. Noise-only changes leave the latent mechanism's
+population theta10 unchanged but change the observed-data distribution. Changing
+any of these settings requires a new run directory and a matching mechanism;
+full DGP comparison rejects importing an old mechanism with different factor
+dimensions or noise SDs. These CLI options support future prespecified studies
+and do not change any frozen experiment, loss, weights or network architecture.
 
 The treatment assignment defaults to `--treatment-link linear`, using
 `e(f_X) = expit(sum_j alpha_j * f_Xj)`. The exploratory

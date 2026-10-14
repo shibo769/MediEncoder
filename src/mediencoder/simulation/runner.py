@@ -287,6 +287,10 @@ def make_config(args):
         mechanism_seed=args.mechanism_seed, seed_base=args.seed_base,
         n_values=args.n, B_requested=args.reps, methods=args.arms,
         dgp=DGPConfig(p=args.p, q=args.q,
+                            bar_p=getattr(args, "factor_dim", 5), bar_q=getattr(args, "factor_dim", 5),
+                            sigma_eps_X=getattr(args, "sigma_eps_x_sd", 2.0),
+                            sigma_eps_M=getattr(args, "sigma_eps_m_sd", 1.0),
+                            sigma_y=getattr(args, "sigma_y_sd", 1.0),
                             alpha_upper=args.alpha_upper,
                             treatment_link=getattr(args, "treatment_link", "linear"),
                             sigma_U_scale=getattr(args, "sigma_u_scale", 0.05),
@@ -895,6 +899,14 @@ def parse_args(argv=None):
     parser.add_argument("--n", type=lambda s: [int(x) for x in s.split(",")], default=[100,300,800,1200,2000,3000])
     parser.add_argument("--p", type=int, default=500, help="Number of observed covariates (default 500)")
     parser.add_argument("--q", type=int, default=500, help="Number of observed mediators (default 500)")
+    parser.add_argument("--factor-dim", type=int, choices=range(1, 6), default=5,
+                        help="Common number of true covariate and mediator factors, bar_p=bar_q; 1 through 5 (default 5), separate from learned dimensions")
+    parser.add_argument("--sigma-eps-x-sd", type=float, default=2.0,
+                        help="Finite nonnegative SD of additive observed-X measurement noise, sigma_eps_X (default 2)")
+    parser.add_argument("--sigma-eps-m-sd", type=float, default=1.0,
+                        help="Finite nonnegative SD of additive observed-M measurement noise, sigma_eps_M (default 1); separate from Sigma_U")
+    parser.add_argument("--sigma-y-sd", type=float, default=1.0,
+                        help="Finite nonnegative SD of each potential-outcome Gaussian noise, sigma_y (default 1)")
     parser.add_argument("--latent-p", type=int, default=10,
                         help="Learned covariate representation dimension, shared by every method (default 10)")
     parser.add_argument("--latent-q", type=int, default=10,
@@ -955,7 +967,9 @@ def parse_args(argv=None):
         if not math.isfinite(args.sigma_u_scale) or args.sigma_u_scale <= 0:
             raise ValueError("--sigma-u-scale must be finite and strictly positive")
         from mediencoder.simulation.dgp import DGPConfig
-        DGPConfig(p=args.p, q=args.q, alpha_upper=args.alpha_upper,
+        DGPConfig(p=args.p, q=args.q, bar_p=args.factor_dim, bar_q=args.factor_dim,
+                  sigma_eps_X=args.sigma_eps_x_sd, sigma_eps_M=args.sigma_eps_m_sd,
+                  sigma_y=args.sigma_y_sd, alpha_upper=args.alpha_upper,
                   treatment_link=args.treatment_link, sigma_U_scale=args.sigma_u_scale,
                   delta1_spread=args.delta1_spread, delta1_shift=args.delta1_shift,
                   delta1_contrast=args.delta1_contrast, loading_family=args.loading_family,
