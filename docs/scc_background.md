@@ -69,7 +69,7 @@ The phases are:
    seeds, pairing, score checksums, fold coverage, estimates, within-fold standard
    errors, and confidence intervals. Missing fits and failures remain explicit.
 
-## Example CPU plan
+## Fixed CPU plan: eight workers per element, sixteen elements
 
 Run these commands on SCC after loading the Python module. Run paths must be
 fresh and outside the mutable source checkout. The commands below are examples;
@@ -84,15 +84,24 @@ RUN=/restricted/project/adsgrp/Allcodes/mediencoder_runs/cpu_example
 
 "$PY" "$CODE/scripts/scc_simulation.py" init \
   --source-dir "$CODE" --run-dir "$RUN" --python "$PY" \
-  --device cpu --cores 16 --concurrency 128 --cpu-slot-budget 128 \
+  --device cpu --worker-selection fixed --workers 8 --cores 8 \
+  --concurrency 16 --cpu-slot-budget 128 \
   --mem-per-core-gb 4 --wall-seconds 43200
 
 "$PY" "$RUN/source/scripts/scc_simulation.py" submit --run-dir "$RUN" --phase prepare
 ```
 
-The CPU benchmark compares 1/2/4/8/16 workers. Every worker uses one Torch/BLAS
-thread. Formal elements request the selected number of cores, and the array
-concurrency is capped by both `--concurrency` and the total CPU-slot budget.
+This fixed plan retains real validation gates: a balanced 20-fit benchmark of
+the eight-worker pool with a 20-epoch cap, followed by all 30 canary fits under
+the full 300-epoch cap and existing early-stopping rule. Neither gate can change
+the prespecified eight-worker count. Each formal element reserves eight CPU
+cores and 32 GB of host RAM; sixteen simultaneous elements reserve 128 cores
+and up to 512 GB. Every worker uses one Torch/BLAS thread.
+
+For automatic selection, `--worker-selection benchmark` is the compatible
+default and compares 1/2/4/8/16 workers up to `--cores`. Formal elements then
+request the selected number of cores, and array concurrency is capped by both
+`--concurrency` and the total CPU-slot budget.
 For example, 8 selected workers and 16 simultaneous elements use up to 128 cores.
 The requested budget may spend time queued rather than being allocated at once.
 For each worker count, the tool projects single-element fits/hour multiplied by

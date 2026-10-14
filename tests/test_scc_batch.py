@@ -26,7 +26,8 @@ def make_plan(tmp_path, **resource_overrides):
     args = Namespace(source_dir=source, run_dir=tmp_path / "run", python=tmp_path / "venv/bin/python",
                      python_module="python3/3.12.4", project="adsgrp", gpu_type="L40S",
                      gpu_memory_gb=24, workers=1, concurrency=2, cores=4, mem_per_core_gb=4,
-                     wall_seconds=43200, device="cuda", cpu_slot_limit=16, gpu_pool="shared")
+                     wall_seconds=43200, device="cuda", cpu_slot_limit=16, gpu_pool="shared",
+                     worker_selection="benchmark")
     for name, value in resource_overrides.items():
         setattr(args, name, value)
     assert scc.initialize(args) == 0
@@ -43,7 +44,10 @@ def add_checks(plan):
     add_ready(plan)
     root = Path(plan["run_dir"])
     scc.atomic_json(root / "benchmark_results.json", {"fixture": "checked"})
-    scc.write_marker(plan, "BENCHMARK_PASSED", selected_workers=(1 if plan["resources"]["device"] == "cuda" else 2),
+    fixed = plan["resources"].get("worker_selection") == "fixed"
+    selected = plan["resources"]["workers"] if fixed else (1 if plan["resources"]["device"] == "cuda" else 2)
+    scc.write_marker(plan, "BENCHMARK_PASSED", selected_workers=selected,
+                     worker_selection=plan["resources"].get("worker_selection", "benchmark"),
                      results_sha256=scc.sha256(root / "benchmark_results.json"))
     scc.atomic_json(root / "canary_audit.json", dict(plan_hash=plan["plan_hash"],
                     all_records_validated=True, files={}))
@@ -286,6 +290,83 @@ def test_cpu_budget_projection_can_prefer_one_worker_over_faster_eight_worker_jo
     # The resource projection and scheduler use one allocation calculation.
     assert scc.array_allocation(plan, 1) == {"cores": 1, "concurrency": 8}
     assert scc.array_allocation(plan, 8) == {"cores": 8, "concurrency": 1}
+
+
+def test_fixed_eight_worker_plan_retains_real_benchmark_gate_and_exact_128_core_array(tmp_path, monkeypatch):
+    root, plan, _ = make_plan(tmp_path, device="cpu", worker_selection="fixed", workers=8,
+                              cores=8, concurrency=16, cpu_slot_limit=128)
+    assert scc.benchmark_workers(plan) == [8]
+    assert scc.array_allocation(plan, 8) == {"cores": 8, "concurrency": 16}
+    assert not (root / "BENCHMARK_PASSED.json").exists()
+    with pytest.raises(ValueError, match="BENCHMARK_PASSED"):
+        scc.measured_workers(plan)
+    add_ready(plan)
+    monkeypatch.setenv("JOB_ID", "fixed-eight-capacity-check")
+    monkeypatch.setattr(scc, "runner_module", lambda *args: Namespace())
+    commands = []
+    def profile(command, device):
+        commands.append(command)
+        assert device == "cpu"
+        destination = Path(command[command.index("--output-dir")+1])
+        count = int(command[command.index("--max-tasks")+1])
+        for index in range(count):
+            scc.atomic_json(destination / "tasks" / f"task-{index}.json", {"status": "complete"})
+        scc.atomic_json(destination / "status.json", {"completed": count})
+        return dict(exit_code=0, elapsed_seconds=60)
+    monkeypatch.setattr(scc, "profile_command", profile)
+    assert scc.execute(root, "benchmark") == 0
+    assert len(commands) == 1
+    command = commands[0]
+    assert command[command.index("--workers")+1] == "8"
+    assert command[command.index("--reps")+1] == "4"
+    assert command[command.index("--max-tasks")+1] == "20"
+    assert command[command.index("--pilot-epochs")+1] == "20"
+    assert scc.measured_workers(plan) == 8
+    selected = scc.read_json(root / "BENCHMARK_PASSED.json")
+    assert selected["worker_selection"] == "fixed"
+    assert selected["selection_criterion"] == "prespecified_workers"
+    argv = scc.qsub_argv(plan, "array", "me_fixed_eight")
+    assert argv[argv.index("-pe")+2] == "8"
+    assert argv[argv.index("-tc")+1] == "16"
+    assert "mem_per_core=4G" in argv and "h_rt=12:00:00" in argv
+    assert not any("gpus=" in value for value in argv)
+    with pytest.raises(ValueError, match="CANARY_PASSED"):
+        scc.submit(root, "array", dry_run=True)
+    assert plan["science_args"] == scc.science_args("cpu")
+    assert plan["science_args"][plan["science_args"].index("--reps")+1] == "200"
+
+
+@pytest.mark.parametrize("overrides, message", [
+    ({"device": "cpu", "worker_selection": "fixed", "workers": 8, "cores": 4}, "reserved CPU cores"),
+    ({"device": "cpu", "worker_selection": "fixed", "workers": 3}, "Fixed workers"),
+    ({"device": "cuda", "worker_selection": "fixed", "workers": 2}, "one worker per GPU"),
+])
+def test_fixed_worker_selection_rejects_incompatible_resources(tmp_path, overrides, message):
+    with pytest.raises(ValueError, match=message):
+        make_plan(tmp_path, **overrides)
+
+
+def test_legacy_plan_and_benchmark_marker_retain_automatic_selection(tmp_path):
+    root, plan, _ = make_plan(tmp_path, device="cpu", cores=8)
+    plan["resources"].pop("worker_selection")
+    plan["plan_hash"] = scc.object_hash({name: value for name, value in plan.items() if name != "plan_hash"})
+    scc.atomic_json(root / "plan.json", plan)
+    assert scc.benchmark_workers(scc.load_plan(root)) == [1, 2, 4, 8]
+    add_ready(plan)
+    scc.atomic_json(root / "benchmark_results.json", {"fixture": "legacy-automatic-check"})
+    scc.write_marker(plan, "BENCHMARK_PASSED", selected_workers=4,
+                     results_sha256=scc.sha256(root / "benchmark_results.json"))
+    assert scc.measured_workers(plan) == 4
+
+
+def test_fixed_plan_cannot_use_a_marker_from_automatic_worker_selection(tmp_path):
+    root, plan, _ = make_plan(tmp_path, device="cpu", worker_selection="fixed", workers=8, cores=8)
+    add_ready(plan)
+    scc.atomic_json(root / "benchmark_results.json", {"fixture": "wrong-selection-mode"})
+    scc.write_marker(plan, "BENCHMARK_PASSED", selected_workers=8,
+                     worker_selection="benchmark", results_sha256=scc.sha256(root / "benchmark_results.json"))
+    with pytest.raises(ValueError, match="worker-selection mode"):
+        scc.measured_workers(plan)
 
 
 @pytest.mark.parametrize("interruption", ["keyboard", "SIGTERM"])

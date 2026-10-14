@@ -134,6 +134,11 @@ def validate_resources(resources):
             raise ValueError(f"{field} must be a positive integer")
     if resources["workers"] > resources["cores"]:
         raise ValueError("Worker count exceeds reserved CPU cores")
+    selection = resources.get("worker_selection", "benchmark")
+    if selection not in ("benchmark", "fixed"):
+        raise ValueError("worker_selection must be benchmark or fixed")
+    if selection == "fixed" and resources["workers"] not in (1, 2, 4, 8, 16):
+        raise ValueError("Fixed workers must be one of 1, 2, 4, 8, 16")
     if resources["device"] not in ("cpu", "cuda"):
         raise ValueError("SCC device must be cpu or cuda")
     if resources["gpu_pool"] not in GPU_POOLS:
@@ -172,6 +177,7 @@ def initialize(args):
     slot_budget = args.cpu_slot_limit if args.cpu_slot_limit is not None else (16 if args.device == "cuda" else 256)
     resources = dict(project=args.project, gpu_type=args.gpu_type, device=args.device, gpu_pool=args.gpu_pool,
                      gpu_memory_gb=args.gpu_memory_gb, workers=args.workers,
+                     worker_selection=getattr(args, "worker_selection", "benchmark"),
                      concurrency=(args.concurrency if args.concurrency is not None else
                                   GPU_POOLS[args.gpu_pool][0] if args.device == "cuda" else slot_budget),
                      cores=args.cores, cpu_slot_limit=slot_budget,
@@ -276,6 +282,8 @@ def measured_workers(plan):
     if verified.get("results_sha256") != sha256(Path(plan["run_dir"]) / "benchmark_results.json"):
         raise ValueError("Benchmark results changed after worker selection")
     selected = verified["selected_workers"]
+    if verified.get("worker_selection", "benchmark") != plan["resources"].get("worker_selection", "benchmark"):
+        raise ValueError("Benchmark worker-selection mode differs from the frozen plan")
     if selected not in benchmark_workers(plan):
         raise ValueError("Benchmark selected an unsupported worker count")
     return selected
@@ -284,7 +292,11 @@ def measured_workers(plan):
 def benchmark_workers(plan):
     # SCC may configure allocated GPUs in EXCLUSIVE_PROCESS mode. Until a
     # sharing mechanism is explicitly verified, one Python worker owns one GPU.
-    candidates = (1,) if plan["resources"]["device"] == "cuda" else (1, 2, 4, 8, 16)
+    resources = plan["resources"]
+    candidates = ((resources["workers"],) if resources.get("worker_selection", "benchmark") == "fixed"
+                  else (1,) if resources["device"] == "cuda" else (1, 2, 4, 8, 16))
+    if resources["device"] == "cuda" and candidates != (1,):
+        raise ValueError("Safe SCC GPU execution requires one worker per GPU")
     return [value for value in candidates if value <= plan["resources"]["cores"]]
 
 
@@ -656,11 +668,14 @@ def execute(root, phase):
                 return profile["exit_code"] or 2
         best = max(rows, key=lambda row: row["projected_aggregate_fits_per_hour"])
         write_marker(plan, "BENCHMARK_PASSED", selected_workers=best["workers"],
+                     worker_selection=plan["resources"].get("worker_selection", "benchmark"),
                      results_sha256=sha256(root / "benchmark_results.json"),
                      fits_per_hour=best["fits_per_hour"],
                      projected_aggregate_fits_per_hour=best["projected_aggregate_fits_per_hour"],
                      projected_array_concurrency=best["projected_array_concurrency"],
-                     selection_criterion="projected_aggregate_fits_per_hour")
+                     selection_criterion=("prespecified_workers"
+                         if plan["resources"].get("worker_selection", "benchmark") == "fixed"
+                         else "projected_aggregate_fits_per_hour"))
         return 0
     if phase in ("canary", "array"):
         marker(plan, "READY")
@@ -749,6 +764,8 @@ def main(argv=None):
     init.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     init.add_argument("--gpu-memory-gb", type=int, default=24)
     init.add_argument("--workers", type=int, default=1)
+    init.add_argument("--worker-selection", choices=("benchmark", "fixed"), default="benchmark",
+                      help="Select workers using the benchmark (default), or pin --workers while retaining real benchmark and full-setting canary gates")
     init.add_argument("--concurrency", type=int, default=None)
     init.add_argument("--cores", type=int, default=4)
     init.add_argument("--cpu-slot-budget", "--cpu-slot-limit", dest="cpu_slot_limit", type=int, default=None,
