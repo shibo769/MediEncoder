@@ -26,6 +26,7 @@ from scipy.stats import norm
 from mediencoder.models import (
     train_nuisance_nn,
     DEFAULT_NUISANCE_HIDDEN,
+    NUISANCE_INPUT_CONSTANT_SD_THRESHOLD,
     predict_nn,
     train_autoencoder,
     encode_with_autoencoder
@@ -1534,6 +1535,11 @@ def estimate_triply_IF(
         "prediction_mse": float(prediction_mse),
         "prediction_rmse": float(prediction_rmse)
     }
+    if nn_cfg is not None and nn_cfg.get("standardize_inputs", False):
+        out["estimator_contract"]["nuisance_input_standardization"] = (
+            "each_model_training_subset_mean_population_sd")
+        out["estimator_contract"]["nuisance_input_constant_sd_threshold"] = (
+            NUISANCE_INPUT_CONSTANT_SD_THRESHOLD)
     if isinstance(rep_fit_info, dict) and "selected_beta_kl" in rep_fit_info:
         # VAE's per-fold-selected beta_kl (averaged over the two representation
         # halves by _merge_rep_fit_info), surfaced so the driver can record which

@@ -51,7 +51,11 @@ New main runs use fixed additive polynomial measurement maps of degree 3:
 `phi_k(f) = sum_j sum_{r=1}^3 C[k,j,r-1] * f[j]^r`, with independent Gaussian
 coefficients of variance `coef_scale^2 / 3`. X and M use separate loading streams.
 Current main defaults use p=q=500, five true factors per block, and ten learned
-coordinates per block. Treatment coefficients are fixed draws from Uniform(0,1);
+coordinates per block. `--latent-p` and `--latent-q` set the positive learned
+dimensions for X and M for all five methods; both default to 10 and are recorded
+as `tilde_p` and `tilde_q` in the scientific manifest. These switches do not change
+the five true factors in the data-generating mechanism.
+Treatment coefficients are fixed draws from Uniform(0,1);
 delta_0 and delta_1 are independent fixed draws with entries Uniform(0.9,1.1).
 Gaussian mediator innovations, outcome equations, and noise SDs X=2, M=1, Y=1
 are retained. This creates a new mechanism and does not resume historical results.
@@ -81,6 +85,21 @@ standardization to every method, fitting means and SDs only on that method's
 representation-training rows. It preserves the loss formula and weights but
 changes its input units, so it defines a separate scientific setting. The default
 is `--preprocessing none`.
+
+The separate opt-in `--nuisance-standardize` switch standardizes the input
+features of every shared nuisance model for all five methods. Each nuisance fit
+estimates its feature means and SDs only from that model's training subset,
+including any treatment restriction; it stores those statistics as model buffers
+and reuses them unchanged for validation and prediction. It uses population SD;
+coordinates with training SD at most 1e-8 are centered with scale one to avoid
+amplifying effectively constant features. Y remains in its original
+units. This is distinct from `--preprocessing`, which transforms observed X/M
+inputs for representation learning. Nuisance standardization is disabled by
+default; when enabled, the manifest records `nuisance_standardize: true` and
+`training.nn_cfg.standardize_inputs: true`. It changes neither representation
+configuration (`ae_cfg`/`me_cfg`) nor the alignment loss or its weights. Treat
+either switch or a changed latent dimension as a separate scientific run and use
+a new output directory.
 
 Start with a small execution check:
 

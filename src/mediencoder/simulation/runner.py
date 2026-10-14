@@ -272,10 +272,15 @@ def make_config(args):
     pilot = args.pilot_epochs is not None
     epochs = args.pilot_epochs if pilot else 300
     training = training_configuration(epochs, getattr(args, "weight_decay", 0.0))
+    nuisance_standardize = getattr(args, "nuisance_standardize", False)
+    if nuisance_standardize:
+        # This option belongs only to nuisance models. Do not put it in the
+        # shared optimizer settings inherited by the representation trainers.
+        training["nn_cfg"]["standardize_inputs"] = True
     if mode == "fixed" and training:
         for key, value in zip(("lambda1", "lambda2", "lambda3"), tune[0]):
             training["me_cfg"][key] = value
-    return jsonable(dict(
+    config = dict(
         schema_version=2, run_kind=("PILOT_NOT_FOR_PAPER" if pilot else
                                    "BENCHMARK_NOT_FOR_PAPER" if args.max_tasks is not None else "FORMAL"),
         estimand="population E[mu10(f_X)] conditional on fixed mechanism",
@@ -287,7 +292,7 @@ def make_config(args):
                             loading_family=getattr(args, "loading_family", "polynomial"),
                             loading_strength=getattr(args, "loading_strength", 4.0),
                             loading_frequency=getattr(args, "loading_frequency", 1.0)).to_dict(),
-        tilde_p=10, tilde_q=10,
+        tilde_p=getattr(args, "latent_p", 10), tilde_q=getattr(args, "latent_q", 10),
         preprocessing=getattr(args, "preprocessing", "none"),
         training=training,
         lambda_mode=mode, lambda_grid=tune, lambda_grid_zero=zero,
@@ -299,7 +304,12 @@ def make_config(args):
         interval="theta_hat +/- 1.959963984540054 * sqrt(sum_k(n_k * var(scores_in_fold_k, ddof=1))/n^2)",
         numeric_safeguards=dict(propensity_clip_eps=0.01, density_ratio_cap=0.0, density_ratio_soft_cap=0.0),
         device=args.device, torch_threads=1, deterministic_algorithms=True,
-    ))
+    )
+    # Omit disabled opt-in metadata so the default canonical configuration
+    # remains compatible with the previous simulation settings.
+    if nuisance_standardize:
+        config["nuisance_standardize"] = True
+    return jsonable(config)
 
 
 def task_seeds(seed_base, n, rep):
@@ -882,6 +892,10 @@ def parse_args(argv=None):
     parser.add_argument("--n", type=lambda s: [int(x) for x in s.split(",")], default=[100,300,800,1200,2000,3000])
     parser.add_argument("--p", type=int, default=500, help="Number of observed covariates (default 500)")
     parser.add_argument("--q", type=int, default=500, help="Number of observed mediators (default 500)")
+    parser.add_argument("--latent-p", type=int, default=10,
+                        help="Learned covariate representation dimension, shared by every method (default 10)")
+    parser.add_argument("--latent-q", type=int, default=10,
+                        help="Learned mediator representation dimension, shared by every method (default 10)")
     from mediencoder.simulation.dgp import LOADING_FAMILIES
     parser.add_argument("--loading-family", choices=LOADING_FAMILIES, default="polynomial",
                         help="Fixed measurement family; polynomial is the retained default")
@@ -891,6 +905,8 @@ def parse_args(argv=None):
                         help="Positive tanh input frequency for nonlinear measurement families")
     parser.add_argument("--preprocessing", choices=("none", "standardize"), default="none",
                         help="Shared representation-input preprocessing, fitted only on representation-training rows")
+    parser.add_argument("--nuisance-standardize", action="store_true",
+                        help="Standardize each nuisance model's input features using only its training subset; leave Y unchanged (default disabled)")
     parser.add_argument("--alpha-upper", type=float, default=1.0,
                         help="Treatment coefficient upper bound for Uniform(0, bound), default 1")
     parser.add_argument("--delta1-spread", type=float, default=0.2,
@@ -951,6 +967,8 @@ def parse_args(argv=None):
         parser.error("--time-limit-seconds must be finite and positive")
     if args.p < 1 or args.q < 1:
         parser.error("--p and --q must be positive")
+    if args.latent_p < 1 or args.latent_q < 1:
+        parser.error("--latent-p and --latent-q must be positive")
     if args.target_reps is not None and not 1 <= args.target_reps <= args.reps:
         parser.error("--target-reps must be between 1 and --reps")
     if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:

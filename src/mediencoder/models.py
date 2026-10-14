@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from mediencoder.nn_utils import build_mlp, device
 
 DEFAULT_NUISANCE_HIDDEN = (300, 300)
+NUISANCE_INPUT_CONSTANT_SD_THRESHOLD = 1e-8
 
 # ============================================================
 # 1) Generic NN for nuisance
@@ -41,6 +42,50 @@ class DeepNN(nn.Module):
         return self.net(x)
 
 
+class StandardizedDeepNN(DeepNN):
+    """Nuisance network with immutable statistics from its own training subset.
+
+    Keeping the transform inside forward makes training, validation and every
+    prediction use the same statistics. Buffers follow the model's device and
+    are included in state_dict; they are never recomputed from prediction data.
+    """
+
+    def __init__(self, input_dim, *, input_mean, input_scale, input_count, **kwargs):
+        if (input_mean.shape != (input_dim,) or input_scale.shape != (input_dim,)
+                or not torch.isfinite(input_mean).all()
+                or not torch.isfinite(input_scale).all() or torch.any(input_scale <= 0)):
+            raise ValueError("Nuisance input statistics must be finite vectors with positive scales")
+        super().__init__(input_dim, **kwargs)
+        self.register_buffer("input_mean", input_mean.detach().clone())
+        self.register_buffer("input_scale", input_scale.detach().clone())
+        self.register_buffer("input_count", torch.tensor(int(input_count), dtype=torch.int64))
+
+    def forward(self, x):
+        if not torch.isfinite(x).all():
+            raise ValueError("Nuisance prediction inputs must be finite")
+        standardized = (x - self.input_mean) / self.input_scale
+        if not torch.isfinite(standardized).all():
+            raise ValueError("Nonfinite standardized nuisance inputs")
+        return super().forward(standardized)
+
+
+def _nuisance_training_input_statistics(X_train):
+    """Population-SD moments of the actual fitting tensor, accumulated in float64."""
+    if not torch.isfinite(X_train).all():
+        raise ValueError("Nuisance fitting inputs must remain finite after float32 conversion")
+    values = X_train.to(torch.float64)
+    mean = values.mean(dim=0)
+    scale = torch.sqrt(torch.mean(torch.square(values - mean), dim=0))
+    mean, scale = mean.to(X_train.dtype), scale.to(X_train.dtype)
+    # Do not amplify effectively constant latent coordinates. This fixed rule
+    # applies identically to every method, and only when scaling is enabled.
+    scale = torch.where(scale > NUISANCE_INPUT_CONSTANT_SD_THRESHOLD,
+                        scale, torch.ones_like(scale))
+    if not torch.isfinite(mean).all() or not torch.isfinite(scale).all():
+        raise ValueError("Nonfinite nuisance training-input moments")
+    return mean, scale
+
+
 def train_nuisance_nn(
     X_train, Y_train,
     X_val, Y_val,
@@ -66,8 +111,19 @@ def train_nuisance_nn(
     gamma=0.5,
     patience=25,
     early_stop=True,
-    verbose=False
+    verbose=False,
+    standardize_inputs=False,
 ):
+    """Fit a nuisance NN, optionally standardizing only its input training subset.
+
+    Targets, loss and training hyperparameters are unchanged. When enabled,
+    each invocation learns its own mean/population SD from X_train only,
+    including arm-specific outcome and nested-regression training subsets.
+    Coordinates with SD <= 1e-8 are centered with scale one.
+    The disabled branch retains the original network and numerical operations.
+    """
+    if not isinstance(standardize_inputs, (bool, np.bool_)):
+        raise ValueError("standardize_inputs must be a boolean")
     arrays = [np.asarray(v) for v in (X_train, Y_train, X_val, Y_val)]
     if any(v.size == 0 or not np.isfinite(v).all() for v in arrays):
         raise ValueError("Nuisance training/validation subsets must be nonempty and finite")
@@ -85,11 +141,19 @@ def train_nuisance_nn(
     X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
     Y_val_t = torch.tensor(Y_val, dtype=torch.float32).unsqueeze(1).to(device)
 
-    model = DeepNN(
+    network_class, input_statistics = DeepNN, {}
+    if standardize_inputs:
+        mean, scale = _nuisance_training_input_statistics(X_train_t)
+        if not torch.isfinite(X_val_t).all():
+            raise ValueError("Nuisance validation inputs must remain finite after float32 conversion")
+        network_class = StandardizedDeepNN
+        input_statistics = dict(input_mean=mean, input_scale=scale, input_count=len(X_train_t))
+    model = network_class(
         X_train.shape[1],
         hidden_dims=hidden_dims,
         activation=activation,
-        dropout=dropout
+        dropout=dropout,
+        **input_statistics,
     ).to(device)
 
     optimizer = optim.Adam(
