@@ -1,5 +1,9 @@
 # MediEncoder
 
+**Paper:** Shi Bo, Debarghya Mukherjee, and AmirEmad Ghassami,
+[*MediEncoder: Nonlinear Representation Learning for High-Dimensional Causal
+Mediation Analysis*](https://arxiv.org/abs/2606.30648).
+
 Representation learning and cross-fitted estimation for causal mediation analysis.
 This research implementation separates the estimator from simulated truth and uses
 observation-level cross-fitted scores for dataset-specific uncertainty estimates.
